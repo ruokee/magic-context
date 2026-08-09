@@ -6,6 +6,7 @@ import type { ContextDatabase } from "@magic-context/core/features/magic-context
 
 const STATUS_KEY = "magic-context";
 const RECENT_FAILURE_MS = 60_000;
+const STATUS_VISIBLE_MS = 4_000;
 const recompSessions = new Set<string>();
 
 export interface StatusLineDeps {
@@ -28,13 +29,9 @@ type SessionMetaStatus = {
 };
 
 const lastRenderedBySession = new Map<string, string>();
+const statusClearTimers = new Map<string, NodeJS.Timeout>();
 
-/**
- * Persistent Magic Context footer status for Pi.
- *
- * Hot path by design: one session_meta row read + ctx.getContextUsage(). No tag
- * or compartment enumeration here; the rich breakdown is reserved for /ctx-status.
- */
+/** Brief Magic Context state-change notice for OMP's hook-status area. */
 export function registerStatusLine(
 	pi: ExtensionAPI,
 	deps: StatusLineDeps,
@@ -57,31 +54,40 @@ export function registerStatusLine(
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const sessionId = resolveSessionId(ctx);
-		if (sessionId) lastRenderedBySession.delete(sessionId);
+		if (sessionId) {
+			lastRenderedBySession.delete(sessionId);
+			clearTimeout(statusClearTimers.get(sessionId));
+			statusClearTimers.delete(sessionId);
+		}
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 }
 
 export function updateStatusLine(
 	ctx: ExtensionContext,
-	_deps: StatusLineDeps,
-	_force = false,
+	deps: StatusLineDeps,
+	force = false,
 ): void {
-	ctx.ui.setStatus(STATUS_KEY, undefined);
+	const sessionId = resolveSessionId(ctx);
+	if (!sessionId) return;
+	const text = renderStatusText(deps.db, sessionId);
+	if (!force && lastRenderedBySession.get(sessionId) === text) return;
+	lastRenderedBySession.set(sessionId, text);
+
+	clearTimeout(statusClearTimers.get(sessionId));
+	ctx.ui.setStatus(STATUS_KEY, text);
+	statusClearTimers.set(
+		sessionId,
+		setTimeout(() => {
+			statusClearTimers.delete(sessionId);
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+		}, STATUS_VISIBLE_MS),
+	);
 }
 
-function renderStatusText(
-	ctx: ExtensionContext,
-	db: ContextDatabase,
-	sessionId: string,
-): string {
-	const usage = ctx.getContextUsage?.();
-	const inputTokens =
-		typeof usage?.tokens === "number" ? usage.tokens : undefined;
-	const pct = typeof usage?.percent === "number" ? usage.percent : undefined;
+function renderStatusText(db: ContextDatabase, sessionId: string): string {
 	const meta = readSessionMetaStatus(db, sessionId);
-	const state = renderHistorianState(meta, recompSessions.has(sessionId));
-	return `mc: ${inputTokens === undefined ? "--" : fmt(inputTokens)} (${pct === undefined ? "--" : `${Math.round(pct)}%`}) · ${state}`;
+	return `MC:${renderHistorianState(meta, recompSessions.has(sessionId))}`;
 }
 
 function renderHistorianState(
@@ -92,7 +98,7 @@ function renderHistorianState(
 	const lastFailureAt = meta?.historian_last_failure_at ?? 0;
 	if (failureCount > 0 && lastFailureAt > 0) {
 		const ageMs = Date.now() - lastFailureAt;
-		if (ageMs >= 0 && ageMs < RECENT_FAILURE_MS) return "⚠ historian failed";
+		if (ageMs >= 0 && ageMs < RECENT_FAILURE_MS) return "historian-failed";
 	}
 	if (recompActive) return "recomp";
 	if ((meta?.compartment_in_progress ?? 0) !== 0) return "historian";
@@ -125,16 +131,4 @@ function resolveSessionId(ctx: ExtensionContext): string | undefined {
 	} catch {
 		return undefined;
 	}
-}
-
-function fmt(n: number): string {
-	const abs = Math.abs(n);
-	if (abs >= 1_000_000) return `${trim1(n / 1_000_000)}M`;
-	if (abs >= 1_000) return `${trim1(n / 1_000)}K`;
-	return String(Math.round(n));
-}
-
-function trim1(n: number): string {
-	const rounded = n.toFixed(1);
-	return rounded.endsWith(".0") ? rounded.slice(0, -2) : rounded;
 }
