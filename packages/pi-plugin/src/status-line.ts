@@ -64,15 +64,10 @@ export function registerStatusLine(
 
 export function updateStatusLine(
 	ctx: ExtensionContext,
-	deps: StatusLineDeps,
-	force = false,
+	_deps: StatusLineDeps,
+	_force = false,
 ): void {
-	const sessionId = resolveSessionId(ctx);
-	if (!sessionId) return;
-	const text = renderStatusText(ctx, deps.db, sessionId);
-	if (!force && lastRenderedBySession.get(sessionId) === text) return;
-	lastRenderedBySession.set(sessionId, text);
-	ctx.ui.setStatus(STATUS_KEY, text);
+	ctx.ui.setStatus(STATUS_KEY, undefined);
 }
 
 function renderStatusText(

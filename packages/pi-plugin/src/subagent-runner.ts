@@ -200,9 +200,10 @@ function resolveSubagentExtensionEntry(entry: string): string {
 		: trimmed;
 }
 
-const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
-const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
-const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
+const PI_READ_ONLY_BUILTINS = ["read", "grep", "glob"] as const;
+// OMP does not expose Pi's optional AFT navigation tools.
+const PI_AFT_READ_TOOLS = [] as const;
+const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS] as const;
 
 /**
  * Set of subagent agent ids that get ctx_memory in the lean child extension.
@@ -287,8 +288,7 @@ const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
 	// manifest's DB writes, so no ctx_memory is needed.
 	["dreamer-memory-mapper", [...PI_READ_ONLY_BUILTINS, ...PI_AFT_READ_TOOLS]],
 	// maintain-docs: explores the codebase and writes ARCHITECTURE.md/STRUCTURE.md.
-	// All 7 Pi built-ins (read/grep/find/ls + bash/write/edit; git runs via bash),
-	// plus optional AFT read navigation. Deliberately NO ctx_memory/ctx_search — it
+	// OMP read tools plus bash/write/edit; deliberately no ctx_memory/ctx_search.
 	// edits docs, never the memory store. Not in any *_SUBAGENT_TOOL_AGENTS set, so
 	// the lean extension is never loaded and ctx_memory cannot leak in.
 	[
@@ -1514,14 +1514,10 @@ export function buildArgs(
 		// below and explicitly loads only its entries. Prevent recursive startup by
 		// setting MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes
 		// the main entry exit early before registering hooks, tools, or timers.
-		// Disable skills and prompt templates because subagents only need a minimal
-		// startup path.
+		// Disable skills and rules because OMP subagents only need the explicit
+		// system prompt and tool allow-list supplied below.
 		"--no-skills",
-		"--no-prompt-templates",
-		// Hidden one-shot subagents must receive EXACTLY the system prompt we built.
-		// Pi otherwise appends AGENTS.md / CLAUDE.md project context files, which
-		// pollutes the prompt and adds avoidable startup work.
-		"--no-context-files",
+		"--no-rules",
 		// --no-tools is applied below only for unknown or explicitly zero-tool agents.
 		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
 		// discovered extension registry cannot leak unrelated tools into subagents.

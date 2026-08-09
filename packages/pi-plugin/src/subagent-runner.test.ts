@@ -236,10 +236,9 @@ describe("subagent-runner pure helpers", () => {
 			// SessionManager.inMemory()).
 			"--no-session",
 			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
+			"--no-rules",
 			"--tools",
-			"read,grep,find,ls,aft_search",
+			"read,grep,glob",
 			"--system-prompt",
 			TEST_SYSTEM_PROMPT_PATH,
 			"--model",
@@ -260,7 +259,7 @@ describe("subagent-runner pure helpers", () => {
 
 		expect(args).not.toContain("--no-extensions");
 		expect(args).toContain("--no-skills");
-		expect(args).toContain("--no-prompt-templates");
+		expect(args).toContain("--no-rules");
 	});
 
 	it("isolated retry disables discovered extensions but keeps explicit --extension paths", () => {
@@ -319,16 +318,14 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--extension");
 	});
 
-	it("disables project context files so hidden subagents see only our prompt", () => {
+	it("disables rules so hidden subagents see only our prompt", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			model: "anthropic/claude-sonnet",
 		});
 
-		expect(args).toContain("--no-context-files");
-		expect(args.indexOf("--no-context-files")).toBeLessThan(
-			args.indexOf("--tools"),
-		);
+		expect(args).toContain("--no-rules");
+		expect(args.indexOf("--no-rules")).toBeLessThan(args.indexOf("--tools"));
 	});
 
 	it("always includes --no-session so child sessions don't appear in pi resume", () => {
@@ -415,14 +412,14 @@ describe("subagent-runner pure helpers", () => {
 			agent: "historian",
 		});
 		expect(historianArgs).toEqual(
-			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
+			expect.arrayContaining(["--tools", "read,grep,glob"]),
 		);
 		const sidekickArgs = buildArgsForTest({
 			...baseOptions,
 			agent: "sidekick",
 		});
 		expect(sidekickArgs).toEqual(
-			expect.arrayContaining(["--tools", "read,grep,find,ls,ctx_search"]),
+			expect.arrayContaining(["--tools", "read,grep,glob,ctx_search"]),
 		);
 	});
 
@@ -441,15 +438,7 @@ describe("subagent-runner pure helpers", () => {
 		// this dev/test env SUBAGENT_ENTRY_PATH is undefined so --extension and the
 		// dreamer-actions flag are absent — the strict allow-list is independent.)
 		const toolList = args[idx + 1];
-		for (const denied of [
-			"read",
-			"grep",
-			"find",
-			"ls",
-			"bash",
-			"write",
-			"edit",
-		]) {
+		for (const denied of ["read", "grep", "glob", "bash", "write", "edit"]) {
 			expect(toolList).not.toContain(denied);
 		}
 	});
@@ -465,15 +454,7 @@ describe("subagent-runner pure helpers", () => {
 		expect(args[idx + 1]).toBe("ctx_memory");
 		expect(args).not.toContain("--no-tools");
 		const toolList = args[idx + 1];
-		for (const denied of [
-			"read",
-			"grep",
-			"find",
-			"ls",
-			"bash",
-			"write",
-			"edit",
-		]) {
+		for (const denied of ["read", "grep", "glob", "bash", "write", "edit"]) {
 			expect(toolList).not.toContain(denied);
 		}
 	});
@@ -501,7 +482,7 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--tools");
 	});
 
-	it("locks dreamer-docs to file tools plus optional AFT read tools, with no ctx_memory and no extension", () => {
+	it("locks dreamer-docs to OMP file tools, with no ctx_memory and no extension", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-docs",
@@ -509,9 +490,7 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe(
-			"read,grep,find,ls,bash,write,edit,aft_outline,aft_zoom,aft_search",
-		);
+		expect(args[idx + 1]).toBe("read,grep,glob,bash,write,edit");
 		expect(args).not.toContain("--no-tools");
 		// Edits docs, never the memory store: no ctx_memory, and the lean extension
 		// (which would register it) is not loaded for this agent.
@@ -530,7 +509,7 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
 
-	it("locks dreamer-primer-investigator to read-only built-ins, AFT read tools, and ctx_search", () => {
+	it("locks dreamer-primer-investigator to OMP read tools and ctx_search", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-primer-investigator",
@@ -538,9 +517,7 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe(
-			"read,grep,find,ls,aft_outline,aft_zoom,aft_search,ctx_search",
-		);
+		expect(args[idx + 1]).toBe("read,grep,glob,ctx_search");
 		expect(args).not.toContain("--no-tools");
 		// Source-safety + cache-neutrality: no write/edit/bash, and crucially no
 		// ctx_memory (its mutations bump the project memory epoch → bust m[0]).
@@ -553,43 +530,19 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
 
-	it("adds AFT read tools exactly to the intended Pi child allow-lists", () => {
-		const toolListFor = (agent: string) => {
-			const args = buildArgsForTest({ ...baseOptions, agent });
-			const idx = args.indexOf("--tools");
-			return idx >= 0 ? args[idx + 1].split(",") : [];
-		};
-		const aftReadSet = ["aft_outline", "aft_zoom", "aft_search"];
-
+	it("never exposes unavailable AFT tools in OMP child allow-lists", () => {
 		for (const agent of [
 			"dreamer-memory-mapper",
 			"dreamer-primer-investigator",
 			"dreamer-docs",
-		]) {
-			expect(toolListFor(agent)).toEqual(expect.arrayContaining(aftReadSet));
-		}
-
-		for (const agent of [
 			"magic-context-historian",
 			"historian",
 			"historian-recomp",
 			"historian-editor",
 		]) {
-			const tools = toolListFor(agent);
-			expect(tools).toContain("aft_search");
-			expect(tools).not.toContain("aft_outline");
-			expect(tools).not.toContain("aft_zoom");
-		}
-
-		for (const agent of [
-			"dreamer",
-			"magic-context-dreamer",
-			"dreamer-classifier",
-			"dreamer-reviewer",
-			"smart-note-compiler",
-			"dreamer-retrospective",
-		]) {
-			const tools = toolListFor(agent);
+			const args = buildArgsForTest({ ...baseOptions, agent });
+			const idx = args.indexOf("--tools");
+			const tools = idx >= 0 ? args[idx + 1].split(",") : [];
 			expect(tools.some((tool) => tool.startsWith("aft_"))).toBe(false);
 		}
 	});
@@ -1993,10 +1946,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			"json",
 			"--no-session",
 			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
+			"--no-rules",
 			"--tools",
-			"read,grep,find,ls,aft_search",
+			"read,grep,glob",
 			"--system-prompt",
 			expect.stringMatching(/system-prompt\.txt$/),
 			"--model",
