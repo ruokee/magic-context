@@ -42,9 +42,7 @@ export function registerStatusLine(
 		updateStatusLine(ctx, deps, true),
 	);
 	pi.on("agent_end", async (_event, ctx) => updateStatusLine(ctx, deps));
-	pi.on("session_compact", async (_event, ctx) =>
-		updateStatusLine(ctx, deps, true),
-	);
+	pi.on("session_compact", async (_event, ctx) => updateStatusLine(ctx, deps));
 	pi.on("tool_execution_end", async (_event, ctx) =>
 		updateStatusLine(ctx, deps),
 	);

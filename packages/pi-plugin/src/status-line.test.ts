@@ -94,6 +94,13 @@ describe("OMP status notice", () => {
 				"magic-context",
 				undefined,
 			);
+
+			updateStatusLine(harness.ctx, harness.deps);
+			expect(setTimeoutSpy).toHaveBeenCalledTimes(4);
+			expect(harness.setStatus).toHaveBeenLastCalledWith(
+				"magic-context",
+				undefined,
+			);
 		} finally {
 			setMagicContextRecompActive("session", false);
 			setTimeoutSpy.mockRestore();
