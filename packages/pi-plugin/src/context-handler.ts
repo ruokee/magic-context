@@ -1039,6 +1039,10 @@ export interface PiContextHandlerOptions {
 	resolveForProject?: (projectDir: string) => PiContextHandlerOptions;
 	/** Boot-resolved compaction-off flag. It remains fixed for this Pi process. */
 	compactionOff?: boolean;
+	/** Whether the primary agent can call ctx_reduce. Automatic compaction is independent. */
+	agentReduceEnabled?: boolean;
+	/** Whether note triggers and nudges are actionable through ctx_note. */
+	agentNoteEnabled?: boolean;
 	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
 	allowHomeProject?: boolean;
 	maybeAutoEmbedSession?: (
@@ -2800,6 +2804,8 @@ export function registerPiContextHandler(
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
 				compactionOff: options.compactionOff === true,
+				agentReduceEnabled: options.agentReduceEnabled !== false,
+				agentNoteEnabled: options.agentNoteEnabled !== false,
 			});
 			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
 			const postPipelineStart = performance.now();
@@ -2874,7 +2880,7 @@ export function registerPiContextHandler(
 
 			const tNoteNudges = performance.now();
 			try {
-				if (!options.compactionOff) {
+				if (!options.compactionOff && options.agentNoteEnabled !== false) {
 					outputMessages = applyNoteNudges({
 						sessionId,
 						db: options.db,
@@ -2999,7 +3005,11 @@ export function registerPiContextHandler(
 				// tool; subagents do not, so a baseline/nudge there would point at a
 				// missing session-scoped tool. A missing baseline is also how Channel 1
 				// stays off.
-				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
+				if (
+					!options.compactionOff &&
+					options.agentReduceEnabled !== false &&
+					!sessionMetaForCh1.isSubagent
+				) {
 					// Resolve through the SCHEDULER config (the real execute
 					// threshold), not options.historian — when historian is disabled
 					// the historian threshold falls back to 65 and ignores the user's
@@ -4020,6 +4030,10 @@ interface RunPipelineArgs {
 	isSubagent?: boolean;
 	/** Additive-only transform mode: no tags, drops, history trim, markers, or nudges. */
 	compactionOff?: boolean;
+	/** Whether the agent-facing ctx_reduce tool is available. Defaults true. */
+	agentReduceEnabled?: boolean;
+	/** Whether the agent can act on note nudges through ctx_note. Defaults true. */
+	agentNoteEnabled?: boolean;
 	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
 	emergencyCeilingTokens?: number;
 	/** Memory-injection config — when omitted, no <session-history> injection runs. */
@@ -4369,11 +4383,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const alreadyRanHeuristicsThisTurn =
 		currentTurnId !== null &&
 		lastHeuristicsTurnIdBySession.get(args.sessionId) === currentTurnId;
-	// Pi's primary process always registers ctx_reduce. Hidden/no-session child
-	// processes do not use this context handler; if a future path marks a session
-	// as subagent here, suppress visible tags and nudges so the prompt never points
-	// at a missing session-scoped tool.
-	const ctxReduceCallable = !args.sessionMeta.isSubagent;
+	// Visible tags and reduce nudges are useful only when the current agent can
+	// call ctx_reduce. DB-side tags remain available to automatic cleanup.
+	const ctxReduceCallable =
+		args.agentReduceEnabled !== false &&
+		!args.compactionOff &&
+		!args.sessionMeta.isSubagent;
 	// Mid-turn-aware gate for consuming DEFERRED publication signals — mirrors
 	// OpenCode's canConsumeDeferredOnThisPass. `args.schedulerDecision` is ALREADY
 	// the mid-turn-adjusted decision (applyMidTurnDeferral downgrades execute→defer
@@ -4566,7 +4581,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// Subagents never deliver note nudges (gated in postprocess), so
 	// skip accumulating orphan trigger state.
 	try {
-		if (!args.sessionMeta.isSubagent) {
+		if (args.agentNoteEnabled !== false && !args.sessionMeta.isSubagent) {
 			const hasRecentCommit = detectRecentCommit(args.messages);
 			const hadPriorCommitState = commitSeenLastPass.has(args.sessionId);
 			const sawCommitLastPass = commitSeenLastPass.get(args.sessionId) ?? false;

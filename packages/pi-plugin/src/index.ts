@@ -918,8 +918,11 @@ async function startPiMagicContextRuntime(
 	);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
+	// This OMP compatibility fork keeps context management automatic. The main
+	// agent gets read-only recovery tools; mutation tools stay off the surface.
+	const agentMutationToolsEnabled = false;
 	const compactionOff = !isCompactionEnabled(config);
-	setCtxReduceRegisteredGlobally(!compactionOff);
+	setCtxReduceRegisteredGlobally(agentMutationToolsEnabled && !compactionOff);
 	if (!compactionOff) {
 		try {
 			const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
@@ -1027,6 +1030,8 @@ async function startPiMagicContextRuntime(
 		autoSearch: auto,
 		resolveForProject: resolveContextOptionsForProject,
 		compactionOff,
+		agentReduceEnabled: agentMutationToolsEnabled,
+		agentNoteEnabled: agentMutationToolsEnabled,
 		allowHomeProject: cfg.allow_home_project,
 		maybeAutoEmbedSession: (sessionId, dir, identity) => {
 			maybeAutoEmbedPiSession(
@@ -1142,17 +1147,11 @@ async function startPiMagicContextRuntime(
 		// loaded via subagent-entry.ts with the
 		// `--magic-context-dreamer-actions` flag.
 		allowDreamerActions: false,
-		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
-		// can `/cd` between projects, but tool registration happens once at boot,
-		// so gating registration on the BOOT project's memory.enabled would
-		// mismatch the per-project prompt (which re-resolves memory.enabled each
-		// pass): start in a memory-off project and switch to a memory-on one and
-		// the tool would be absent while the prompt advertises it. The tool's
-		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
-		// when the CURRENT project has memory off, so always-register is correct.
-		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
-		// the retrieval-only sidekick, a separate security concern.)
-		memoryToolEnabled: true,
+		// The main OMP agent is retrieval-only: historian and automatic cleanup
+		// manage durable state without asking the agent to maintain it.
+		memoryToolEnabled: agentMutationToolsEnabled,
+		noteToolEnabled: agentMutationToolsEnabled,
+		reduceToolEnabled: agentMutationToolsEnabled,
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
@@ -1170,13 +1169,9 @@ async function startPiMagicContextRuntime(
 		promptSurfaceRuntime,
 	});
 	info(
-		compactionOff
-			? todowriteEnabled
-				? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite; registered /todos (ctx_reduce unavailable in compaction-off mode)"
-				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand (ctx_reduce unavailable in compaction-off mode; todowrite disabled)"
-			: todowriteEnabled
-				? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
-				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
+		todowriteEnabled
+			? "registered tools: ctx_search, ctx_expand, todowrite; registered /todos (agent mutation tools disabled)"
+			: "registered tools: ctx_search, ctx_expand (agent mutation tools disabled; todowrite disabled)",
 	);
 
 	pi.on("session_start", async (event, ctx) => {
@@ -1734,7 +1729,7 @@ async function startPiMagicContextRuntime(
 				memoryEnabled: effectiveConfig.memory.enabled,
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
-				ctxReduceCallable: !compactionOff,
+				ctxReduceCallable: agentMutationToolsEnabled && !compactionOff,
 				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
 				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
 				cavemanTextCompressionEnabled:
@@ -1878,7 +1873,7 @@ async function startPiMagicContextRuntime(
 				: undefined;
 			if (lastAssistant?.stopReason === "stop") {
 				const sessionId = ctx.sessionManager?.getSessionId?.();
-				if (sessionId && db && !compactionOff)
+				if (sessionId && db && agentMutationToolsEnabled && !compactionOff)
 					maybeDeliverChannel2Pi(pi, db, sessionId);
 			}
 		} catch (err) {
@@ -1954,7 +1949,12 @@ async function startPiMagicContextRuntime(
 						(t) => t.status === "completed" || t.status === "cancelled",
 					)
 				) {
-					if (!compactionOff && sessionMeta && !sessionMeta.isSubagent) {
+					if (
+						agentMutationToolsEnabled &&
+						!compactionOff &&
+						sessionMeta &&
+						!sessionMeta.isSubagent
+					) {
 						onNoteTrigger(db, sessionId, "todos_complete");
 					}
 				}
@@ -1974,7 +1974,11 @@ async function startPiMagicContextRuntime(
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			if (!compactionOff && event.toolName === "ctx_reduce") {
+			if (
+				agentMutationToolsEnabled &&
+				!compactionOff &&
+				event.toolName === "ctx_reduce"
+			) {
 				markPiChannel1Reduced(sessionId, db);
 			}
 		} catch (err) {
@@ -2000,7 +2004,7 @@ async function startPiMagicContextRuntime(
 			// queued user message into the NEXT STEP of the in-flight turn so
 			// the agent is warned while the pile is still growing (agent_end
 			// stays as the idle fallback). No-ops unless pending + revalidated.
-			if (compactionOff) return;
+			if (compactionOff || !agentMutationToolsEnabled) return;
 			if (db) maybeDeliverChannel2Pi(pi, db, sessionId, "steer");
 			const block = maybeChannel1ReminderForToolResult({
 				db,

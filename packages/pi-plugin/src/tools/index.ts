@@ -55,6 +55,10 @@ export interface RegisterToolsOptions {
 	/** When false, omit ctx_memory from the registered surface. Sidekick only
 	 *  needs read-only ctx_search; dreamer and the main agent keep ctx_memory. */
 	memoryToolEnabled?: boolean;
+	/** When false, omit ctx_note while keeping ctx_expand available. */
+	noteToolEnabled?: boolean;
+	/** When false, omit ctx_reduce without disabling automatic compaction. */
+	reduceToolEnabled?: boolean;
 	/** When true, omit session-scoped tools (ctx_note, ctx_expand) from the
 	 *  registered surface. Set by `--no-session` children (sidekick, dreamer):
 	 *  those tools resolve `ctx.sessionManager.getSessionId()` to the EPHEMERAL
@@ -132,19 +136,21 @@ export function registerMagicContextTools(
 	// ctx_note and ctx_expand are session-scoped: they resolve the CURRENT
 	// session id at call time. For `--no-session` children that id is the hidden
 	// ephemeral child session, so a note would be orphaned and an expand would
-	// target the child's empty transcript. Omit them for those children; ctx_search
-	// stays available and ctx_memory is controlled above.
+	// target the child's empty transcript. Omit both for those children; primary
+	// agents may independently hide the mutating ctx_note tool.
 	if (!opts.sessionScopedToolsDisabled) {
-		pi.registerTool(
-			surfaceTool(
-				createCtxNoteTool({
-					db: opts.db,
-					dreamerEnabled: opts.dreamerEnabled ?? false,
-					resolveDreamerEnabled: opts.resolveDreamerEnabled,
-					resolveProjectIdentity,
-				}),
-			),
-		);
+		if (opts.noteToolEnabled !== false) {
+			pi.registerTool(
+				surfaceTool(
+					createCtxNoteTool({
+						db: opts.db,
+						dreamerEnabled: opts.dreamerEnabled ?? false,
+						resolveDreamerEnabled: opts.resolveDreamerEnabled,
+						resolveProjectIdentity,
+					}),
+				),
+			);
+		}
 
 		pi.registerTool(surfaceTool(createCtxExpandTool({ db: opts.db })));
 	}
@@ -165,7 +171,11 @@ export function registerMagicContextTools(
 	// ctx_reduce is session-scoped just like ctx_note/ctx_expand: it resolves the
 	// CURRENT session id at call time. Omit it for `--no-session` children where
 	// that id points at a hidden ephemeral child session.
-	if (!opts.sessionScopedToolsDisabled && !opts.compactionOff) {
+	if (
+		!opts.sessionScopedToolsDisabled &&
+		opts.reduceToolEnabled !== false &&
+		!opts.compactionOff
+	) {
 		pi.registerTool(
 			surfaceTool(
 				createCtxReduceTool({

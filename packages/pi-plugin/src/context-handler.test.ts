@@ -1367,6 +1367,32 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("keeps internal tags without exposing §N§ when ctx_reduce is unavailable", async () => {
+		const db = createTestDb();
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				agentReduceEnabled: false,
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+
+			const result = await handler(
+				{ messages: [userMessage("hello", 1)] as never[] },
+				fakeContext("ses-passive-tags") as never,
+			);
+
+			expect(textOf(result.messages[0] as never)).toBe("hello");
+			expect(getTagsBySession(db, "ses-passive-tags")).toHaveLength(1);
+		} finally {
+			clearContextHandlerSession("ses-passive-tags");
+			closeQuietly(db);
+		}
+	});
+
 	it("applies and drains pending drops for the session", async () => {
 		const db = createTestDb();
 		try {
@@ -1466,6 +1492,50 @@ describe("registerPiContextHandler", () => {
 			);
 			expect(textOf(result.messages[0] as never)).toContain("1 deferred note");
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not surface note nudges when ctx_note is unavailable", async () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-passive-notes";
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				agentNoteEnabled: false,
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			addNote(db, "session", { sessionId, content: "hidden reminder" });
+			onNoteTrigger(db, sessionId, "historian_complete");
+
+			const triggerMsg = userMessage("trigger turn", 1);
+			const newMsg = userMessage("new turn", 2);
+			await handler(
+				{ messages: [triggerMsg] as never[] },
+				fakeContext(
+					sessionId,
+					process.cwd(),
+					["entry-trigger"],
+					[triggerMsg],
+				) as never,
+			);
+			const result = await handler(
+				{ messages: [newMsg] as never[] },
+				fakeContext(sessionId, process.cwd(), ["entry-new"], [newMsg]) as never,
+			);
+
+			expect(textOf(result.messages[0] as never)).not.toContain(
+				"deferred_notes",
+			);
+			expect(textOf(result.messages[0] as never)).not.toContain(
+				"hidden reminder",
+			);
+		} finally {
+			clearContextHandlerSession("ses-passive-notes");
 			closeQuietly(db);
 		}
 	});

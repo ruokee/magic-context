@@ -42,6 +42,29 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
+	it("can expose only read-only context recovery tools", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: () => undefined,
+			} as never;
+
+			registerMagicContextTools(pi, {
+				db,
+				memoryToolEnabled: false,
+				noteToolEnabled: false,
+				reduceToolEnabled: false,
+				todowriteEnabled: false,
+			});
+
+			expect(registered).toEqual(["ctx_search", "ctx_expand"]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("removes only ctx_reduce in compaction-off mode", () => {
 		const db = createTestDb();
 		try {
