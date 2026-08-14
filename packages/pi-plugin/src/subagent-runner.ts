@@ -277,10 +277,9 @@ function resolveSubagentExtensionEntry(entry: string): string {
 		: trimmed;
 }
 
-const PI_READ_ONLY_BUILTINS = ["read", "grep", "glob"] as const;
-// OMP does not expose Pi's optional AFT navigation tools.
-const PI_AFT_READ_TOOLS = [] as const;
-const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS] as const;
+const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
+const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
+const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
 
 /**
  * Set of subagent agent ids that get ctx_memory in the lean child extension.
@@ -370,7 +369,8 @@ const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
 	// manifest's DB writes, so no ctx_memory is needed.
 	["dreamer-memory-mapper", [...PI_READ_ONLY_BUILTINS, ...PI_AFT_READ_TOOLS]],
 	// maintain-docs: explores the codebase and writes ARCHITECTURE.md/STRUCTURE.md.
-	// OMP read tools plus bash/write/edit; deliberately no ctx_memory/ctx_search.
+	// All 7 Pi built-ins (read/grep/find/ls + bash/write/edit; git runs via bash),
+	// plus optional AFT read navigation. Deliberately NO ctx_memory/ctx_search — it
 	// edits docs, never the memory store. Not in any *_SUBAGENT_TOOL_AGENTS set, so
 	// the lean extension is never loaded and ctx_memory cannot leak in.
 	[
