@@ -878,6 +878,32 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("preserves provider errors when the failed assistant has no text", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "429 rate limit exceeded",
+				},
+			]),
+		);
+		child.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: false,
+			reason: "model_failed",
+			error: "429 rate limit exceeded",
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+	});
+
 	it("returns model_failed when the final assistant stopReason is aborted", async () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);

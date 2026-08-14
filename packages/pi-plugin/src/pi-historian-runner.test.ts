@@ -400,6 +400,32 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("rolls back drain quota while backing off a failed provider run", async () => {
+		const rateLimitFailure: SubagentRunResult = {
+			ok: false,
+			reason: "model_failed",
+			error: "429 rate limit exceeded",
+			durationMs: 1,
+		};
+		const runner = runnerWithSteps([
+			rateLimitFailure,
+			rateLimitFailure,
+			rateLimitFailure,
+		]);
+		const { db } = await runHistorianWith({
+			runner,
+			retryBackoffMs: () => 0,
+		});
+		try {
+			const meta = loadProtectedTailMeta(db, "ses-historian");
+			expect(meta.protectedTailDrainTokens).toBe(0);
+			expect(meta.historianDrainFailureAt).toBeGreaterThan(0);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("refreshes a stale protected-tail snapshot and proceeds when the current boundary is runnable", async () => {
 		const staleBoundary = makeBoundarySnapshot({
 			rawLastMessageIdAtTrigger: "old-m12",

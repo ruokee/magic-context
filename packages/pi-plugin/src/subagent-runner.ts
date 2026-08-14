@@ -1209,6 +1209,23 @@ export class PiSubagentRunner implements SubagentRunner {
 				if (sawAgentEnd) {
 					const trimmedAssistantText = finalAssistantText?.trim() ?? null;
 					if (
+						finalStopReason === "error" ||
+						finalStopReason === "aborted" ||
+						finalStopReason === "length"
+					) {
+						settle({
+							ok: false,
+							reason:
+								finalStopReason === "length" ? "truncated" : "model_failed",
+							error:
+								finalErrorMessage ??
+								`pi assistant stopped with reason "${finalStopReason}"`,
+							durationMs: Date.now() - startTime,
+							meta: { stderr: stderr.length > 0 ? stderr : undefined },
+						});
+						return;
+					}
+					if (
 						trimmedAssistantText === null ||
 						trimmedAssistantText.length === 0
 					) {
@@ -1228,23 +1245,6 @@ export class PiSubagentRunner implements SubagentRunner {
 								stderr: stderr.length > 0 ? stderr : undefined,
 								sawProtocolOutput: true,
 							},
-						});
-						return;
-					}
-					if (
-						finalStopReason === "error" ||
-						finalStopReason === "aborted" ||
-						finalStopReason === "length"
-					) {
-						settle({
-							ok: false,
-							reason:
-								finalStopReason === "length" ? "truncated" : "model_failed",
-							error:
-								finalErrorMessage ??
-								`pi assistant stopped with reason "${finalStopReason}"`,
-							durationMs: Date.now() - startTime,
-							meta: { stderr: stderr.length > 0 ? stderr : undefined },
 						});
 						return;
 					}

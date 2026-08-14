@@ -160,6 +160,20 @@ describe("emergency drain catch-up latch", () => {
         expect(allowed.overQuotaBypass).toBe(true);
     });
 
+    it("suppresses ordinary in-budget reservations during failure backoff", () => {
+        const t = 6_500_000;
+        recordHistorianDrainFailure(db, SID, t);
+
+        const blocked = reserve(db, SID, 80, t + 1);
+        expect(blocked.ok).toBe(false);
+        expect(blocked.skippedReason).toBe("historian failure backoff active");
+        expect(loadProtectedTailMeta(db, SID).protectedTailDrainTokens).toBe(0);
+
+        const allowed = reserve(db, SID, 80, t + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS);
+        expect(allowed.ok).toBe(true);
+        expect(allowed.overQuotaBypass).toBe(false);
+    });
+
     it("clearEmergencyDrainLatch resets the latch (tail-exhausted no-op)", () => {
         const t = 7_000_000;
         exhaustWindowBudget(db, SID, 96, t);

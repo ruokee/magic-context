@@ -732,8 +732,8 @@ export const EMERGENCY_DRAIN_EXIT_MARGIN = 10;
  */
 export const EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE = 55;
 /**
- * After a genuine historian FAILURE, suppress the latch bypass for this long so a
- * broken historian backs off instead of retry-thrashing every pass under the latch.
+ * After a genuine historian FAILURE, suppress new reservations for this long so
+ * a broken historian backs off without consuming the whole drain window budget.
  */
 export const EMERGENCY_DRAIN_FAILURE_BACKOFF_MS = 60_000;
 /**
@@ -811,17 +811,20 @@ export function reserveProtectedTailDrainTokens(args: {
         }
         const latchActive = latchActiveSince > 0;
 
+        const inFailureBackoff =
+            meta.historianDrainFailureAt > 0 &&
+            now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
+        if (inFailureBackoff) {
+            result.skippedReason = "historian failure backoff active";
+            return;
+        }
+
         const budget = protectedTailWindowBudget(args.usagePercentage, args.usable, args.perRunCap);
         const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
         let reserved = Math.min(requested, args.perRunCap, remaining);
         let bypass = false;
-        // While the latch is active, drain a chunk EVERY pass past the window budget
-        // — UNLESS a recent historian failure is still in its backoff window (so a
-        // broken historian can't retry-thrash under the latch).
-        const inFailureBackoff =
-            meta.historianDrainFailureAt > 0 &&
-            now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
-        if (reserved <= 0 && latchActive && !inFailureBackoff) {
+        // While the latch is active, drain a chunk EVERY pass past the window budget.
+        if (reserved <= 0 && latchActive) {
             reserved = Math.min(requested, args.perRunCap);
             bypass = true;
         }

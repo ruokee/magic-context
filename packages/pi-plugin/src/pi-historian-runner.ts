@@ -1449,13 +1449,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		}
 	} finally {
 		if (!completedSuccessfully) {
-			if (!retainDrainReservationForRetryThrottle) {
-				rollbackDrainReservation();
-			} else {
-				// Genuine historian failure (the retained-reservation retry-throttle
-				// condition) — suppress the emergency catch-up latch bypass for a
-				// short backoff so a broken historian can't retry-thrash. Mirrors
-				// OpenCode.
+			rollbackDrainReservation();
+			if (retainDrainReservationForRetryThrottle) {
+				// Back off failed historian attempts independently from the drain quota.
+				// The reservation must remain available when the backoff expires.
 				recordHistorianDrainFailure(db, sessionId);
 			}
 		}
