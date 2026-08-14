@@ -5,6 +5,7 @@ import {
     buildHiddenAgentRegistrations,
 } from "./agents/hidden-agent-registrations";
 import { withContentLanguageDirective } from "./agents/language-directive";
+import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
@@ -39,6 +40,7 @@ import {
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
 import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
+import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
@@ -352,6 +354,7 @@ const server: Plugin = async (ctx) => {
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
                 mural: pluginConfig.mural,
+                retinaHandoff: pluginConfig.smart_notes.retina_handoff,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
                     ? {
                           enabled: true,
@@ -603,6 +606,10 @@ const server: Plugin = async (ctx) => {
             await magicContextRuntime.magicContext?.["command.execute.before"]?.(input, output);
         },
         "chat.message": async (input, _output) => {
+            // The first real prompt is the lazy-load boundary. Awaiting here keeps
+            // the tokenizer out of cold start while ensuring synchronous token
+            // estimates later in this prompt use the installed package.
+            await preloadTokenizer();
             // Update tool-def measurement latch before delegating to magic-context
             // hooks. `registry.tools()` is invoked right after chat.message inside
             // OpenCode's prompt flow (see session/prompt.ts), so by the time
@@ -745,6 +752,8 @@ const server: Plugin = async (ctx) => {
                 });
 
                 const agentConfig = { ...(config.agent ?? {}) } as NonNullable<typeof config.agent>;
+                const agentConfigRecord = agentConfig as Record<string, Record<string, unknown>>;
+                const internalAgentIds = registrations.map((registration) => registration.id);
                 for (const reg of registrations) {
                     if (typeof reg.prompt !== "string" || reg.prompt.length === 0) {
                         log(
@@ -752,16 +761,21 @@ const server: Plugin = async (ctx) => {
                         );
                         continue;
                     }
-                    agentConfig[reg.id] = buildHiddenAgentConfig(
+                    agentConfigRecord[reg.id] = buildHiddenAgentConfig(
                         reg.prompt,
                         reg.allowedTools,
                         reg.maxSteps,
                         reg.overrides,
                         reg.id,
                         reg.lockPermissions === true,
+                        reg.description,
                     );
                 }
-                config.agent = agentConfig;
+                const callerAgentConfig = denyTaskRoutingToCallerAgents(
+                    agentConfigRecord,
+                    internalAgentIds,
+                );
+                config.agent = callerAgentConfig as NonNullable<typeof config.agent>;
             } catch (error) {
                 // A failure registering commands/agents must NEVER fail the whole
                 // plugin load — that would also disable the transform/compaction

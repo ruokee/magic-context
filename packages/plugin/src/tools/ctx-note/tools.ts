@@ -2,6 +2,11 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import { getLastIndexedOrdinal } from "../../features/magic-context/message-index";
 import {
+    compileSurfaceCondition,
+    conditionCompileReplySuffix,
+    conditionCompileStorageFields,
+} from "../../features/magic-context/smart-notes/condition-compiler";
+import {
     addNote,
     dismissNote,
     getNotes,
@@ -9,6 +14,7 @@ import {
     getSessionNotes,
     type Note,
     setNoteLastReadAt,
+    type UpdateNoteOptions,
     updateNote,
 } from "../../features/magic-context/storage";
 import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
@@ -298,12 +304,17 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 if (!rustNote || !projectIdentity) {
                     return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
                 }
-                if (
-                    action === "write" &&
-                    args.surface_condition?.trim() &&
-                    deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
-                ) {
-                    return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                const surfaceCondition = args.surface_condition?.trim();
+                let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
+                if ((action === "write" || action === "update") && surfaceCondition) {
+                    if (
+                        deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
+                    ) {
+                        return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                    }
+                    compilation = await compileSurfaceCondition(surfaceCondition, {
+                        projectPath: toolContext.directory,
+                    });
                 }
                 const commandId = toolCallIdFromContext(toolContext);
                 const request: RustNoteToolRequest = {
@@ -314,7 +325,8 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     memoryProject: projectIdentity,
                     action,
                     content: args.content,
-                    surfaceCondition: args.surface_condition,
+                    surfaceCondition,
+                    ...(compilation ? conditionCompileStorageFields(compilation) : {}),
                     filter: args.filter,
                     limit: args.limit,
                     offset: args.offset,
@@ -322,8 +334,13 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 };
                 try {
                     const text = moduleNoteText(await rustNote(request));
-                    if (text !== null) return text;
-                    return "Error: Rust module returned an invalid ctx_note response.";
+                    if (text === null) {
+                        return "Error: Rust module returned an invalid ctx_note response.";
+                    }
+                    if (compilation && !text.startsWith("Error:")) {
+                        return text + conditionCompileReplySuffix(compilation);
+                    }
+                    return text;
                 } catch (error) {
                     if (isRustAuthorityDrainingError(error)) {
                         return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
@@ -356,14 +373,19 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     if (!projectIdentity) {
                         return "Error: Could not resolve project identity for smart note.";
                     }
+                    const surfaceCondition = args.surface_condition.trim();
+                    const compilation = await compileSurfaceCondition(surfaceCondition, {
+                        projectPath: toolContext.directory,
+                    });
                     const note = addNote(deps.db, "smart", {
                         content,
                         projectPath: projectIdentity,
                         sessionId,
-                        surfaceCondition: args.surface_condition.trim(),
+                        surfaceCondition,
                         anchorOrdinal,
+                        ...conditionCompileStorageFields(compilation),
                     });
-                    return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${args.surface_condition.trim()}`;
+                    return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${surfaceCondition}${conditionCompileReplySuffix(compilation)}`;
                 }
 
                 // Simple session note
@@ -393,10 +415,17 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 if (typeof noteId !== "number") {
                     return "Error: 'note_id' is required when action is 'update'.";
                 }
-                const updates: { content?: string; surfaceCondition?: string } = {};
+                const updates: UpdateNoteOptions = {};
                 if (args.content?.trim()) updates.content = args.content.trim();
-                if (args.surface_condition?.trim())
-                    updates.surfaceCondition = args.surface_condition.trim();
+                let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
+                if (args.surface_condition?.trim()) {
+                    const surfaceCondition = args.surface_condition.trim();
+                    updates.surfaceCondition = surfaceCondition;
+                    compilation = await compileSurfaceCondition(surfaceCondition, {
+                        projectPath: toolContext.directory,
+                    });
+                    Object.assign(updates, conditionCompileStorageFields(compilation));
+                }
 
                 if (!updates.content && !updates.surfaceCondition) {
                     return "Error: Provide 'content' and/or 'surface_condition' to update.";
@@ -414,7 +443,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 const parts: string[] = [];
                 if (updates.content) parts.push(`Content: ${updates.content}`);
                 if (updates.surfaceCondition) parts.push(`Condition: ${updates.surfaceCondition}`);
-                return `Updated note #${noteId}:\n${parts.join("\n")}`;
+                return `Updated note #${noteId}:\n${parts.join("\n")}${compilation ? conditionCompileReplySuffix(compilation) : ""}`;
             }
 
             const limit =

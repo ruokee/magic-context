@@ -18,6 +18,7 @@ describe("MagicContextConfigSchema", () => {
                 fail_closed_blocking: true,
                 transform_mode: "ts",
                 storage: { enforce_private_permissions: true },
+                smart_notes: { retina_handoff: false },
                 cache_ttl: "5m",
                 prompt_surface: { default: "full" },
                 execute_threshold_percentage: 65,
@@ -108,6 +109,7 @@ describe("MagicContextConfigSchema", () => {
                     overlay: false,
                 },
                 smart_drops: false,
+                smart_notes: { retina_handoff: false },
                 shadow_embedding: {
                     enabled: false,
                 },
@@ -266,6 +268,7 @@ describe("MagicContextConfigSchema", () => {
                 default: "light" as const,
                 models: {
                     "anthropic/claude/sonnet": "full" as const,
+                    "claude-sonnet-4-5": "light" as const,
                     "openai/*": "light" as const,
                 },
                 guidance_override_path: "./guidance.md",
@@ -286,7 +289,7 @@ describe("MagicContextConfigSchema", () => {
         it("rejects malformed prompt-surface model keys and empty override text", () => {
             const malformedKeys = [
                 "",
-                "provider",
+                "model*",
                 "/model",
                 "provider/",
                 "provider//model",

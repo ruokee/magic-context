@@ -3,22 +3,24 @@
  * @cortexkit/magic-context — unified CLI for Magic Context.
  *
  * Subcommands:
- *   setup           Interactive setup wizard for OpenCode and/or Pi.
+ *   setup           Interactive setup wizard for OpenCode, Pi, or OMP.
  *   doctor          Health-check + auto-fix for installed harnesses.
  *     --force         Force-clear plugin cache.
  *     --issue         Bundle a sanitized issue report and submit/open.
  *     --clear         Interactive picker to clear plugin caches.
- *   doctor migrate  Migrate OpenCode session content to Pi JSONL.
+ *   doctor migrate  Migrate OpenCode session content to Pi/OMP JSONL.
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
  *   doctor merge-identity   Merge all project-scoped rows between identities.
+ *   doctor repair-db        Back up and salvage a corrupted shared database.
  *
  * Common flags:
- *   --harness opencode|pi   Target one harness (default: auto-detect / prompt)
+ *   --harness opencode|pi|omp   Target one harness (default: auto-detect / prompt)
  *   --version, -v           Print CLI version and exit
  *   --help, -h              Print help and exit
  */
 import { createRequire } from "node:module";
 import { isPromptCancelledError } from "./lib/prompts";
+import { runSqlitePreflight } from "./lib/sqlite-preflight";
 
 function getVersion(): string {
     const req = createRequire(import.meta.url);
@@ -65,15 +67,17 @@ function printUsage(): void {
     console.log(
         "    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript",
     );
-    console.log("    doctor migrate   Migrate OpenCode session to Pi JSONL");
+    console.log("    doctor migrate   Migrate OpenCode session to Pi or OMP JSONL");
     console.log("    doctor migrate-session   Re-home an OpenCode session to another directory");
     console.log(
         "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
     );
+    console.log("    doctor repair-db   Back up and salvage a corrupted shared database");
     console.log("");
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");
     console.log("    --harness pi          Target Pi only");
+    console.log("    --harness omp         Target Oh My Pi (OMP) only");
     console.log("    (default: auto-detect, prompt if multiple installed)");
     console.log("");
     console.log("  Usage:");
@@ -82,7 +86,7 @@ function printUsage(): void {
     console.log("    npx @cortexkit/magic-context@latest doctor");
     console.log("    npx @cortexkit/magic-context@latest doctor --issue");
     console.log("    npx @cortexkit/magic-context@latest doctor migrate \\");
-    console.log("        --from opencode --to pi --session ses_xxx --dry-run");
+    console.log("        --from opencode --to <pi|omp> --session ses_xxx --dry-run");
     console.log("");
 }
 
@@ -107,6 +111,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         }
 
         if (command === "doctor") {
+            if (!(await runSqlitePreflight())) return 1;
+
             if (rest[0] === "drain-authority") {
                 const projectRoot = rest[1];
                 if (!projectRoot || projectRoot.startsWith("-")) {
@@ -127,6 +133,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
             if (rest[0] === "merge-identity") {
                 const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");
                 return runMergeIdentityCli(rest.slice(1));
+            }
+            if (rest[0] === "repair-db") {
+                const { runRepairDbCli } = await import("./commands/doctor-repair-db");
+                return runRepairDbCli(rest.slice(1));
             }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");

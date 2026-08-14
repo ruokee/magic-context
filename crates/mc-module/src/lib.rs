@@ -81,7 +81,7 @@ use subc_client_rs::{
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
-    child_session_id, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
+    child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
     CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
     MAX_CLASSIFY_PROMPT_BYTES,
 };
@@ -119,7 +119,8 @@ pub mod test_support;
 #[cfg(test)]
 mod differential_goldens;
 use transform::{
-    transform_with_projection_cached, HistorianDiagnostics, SerializedOutputCache, TransformRequest,
+    transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
+    SerializedOutputCache, TransformRequest,
 };
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
@@ -1842,7 +1843,12 @@ impl TransformSnapshotCache {
         }
     }
 
+    #[cfg(test)]
     fn ready_request_clone(&self, session_id: &str) -> Option<Arc<TransformRequest>> {
+        self.ready_delta_request(session_id)
+    }
+
+    fn ready_delta_request(&self, session_id: &str) -> Option<Arc<TransformRequest>> {
         match self.entries.get(session_id) {
             Some(TransformSnapshot::Ready { request, .. }) => Some(Arc::clone(request)),
             _ => None,
@@ -2027,6 +2033,187 @@ impl BoundaryTokenCache {
     }
 }
 
+const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct NativeDeltaFrontier {
+    after: String,
+    native_replace_from: usize,
+    projection_cache: Option<ProjectionCacheInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeAttachmentContext {
+    session_id: String,
+    serializer_profile: String,
+    render_config: String,
+    profile_epoch: u32,
+    transition_consumed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NativeEncodedChunk {
+    start_index: usize,
+    end_index: usize,
+    value: Arc<Value>,
+    retained_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NativeAttachmentCacheStats {
+    reused_messages: usize,
+    encoded_messages: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NativeAttachmentCacheSnapshot {
+    context: NativeAttachmentContext,
+    full_array_fingerprint: Option<String>,
+    sidecar: Arc<codec::DecodeSidecar>,
+    message_keys: Vec<[u8; 32]>,
+    sidecar_hashes: HashMap<String, [u8; 32]>,
+    sidecar_sizes: HashMap<String, usize>,
+    chunks: Vec<NativeEncodedChunk>,
+    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
+}
+
+#[derive(Debug)]
+struct NativeAttachmentCacheSession {
+    revert_epoch: u64,
+    retained_bytes: usize,
+    snapshot: NativeAttachmentCacheSnapshot,
+    #[cfg_attr(not(test), allow(dead_code))]
+    stats: NativeAttachmentCacheStats,
+}
+
+#[derive(Debug)]
+struct NativeAttachmentCache {
+    sessions: HashMap<String, NativeAttachmentCacheSession>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+}
+
+impl Default for NativeAttachmentCache {
+    fn default() -> Self {
+        Self::new(NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES)
+    }
+}
+
+impl NativeAttachmentCache {
+    fn new(max_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+        }
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn snapshot(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+    ) -> Option<NativeAttachmentCacheSnapshot> {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
+        }
+        let snapshot = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.snapshot.clone());
+        if snapshot.is_some() {
+            self.lru.retain(|candidate| candidate != session_id);
+            self.lru.push_back(session_id.to_string());
+        }
+        snapshot
+    }
+
+    fn replace(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+        snapshot: NativeAttachmentCacheSnapshot,
+        stats: NativeAttachmentCacheStats,
+        served_bytes: usize,
+    ) {
+        self.remove(session_id);
+        let encoded_bytes = snapshot
+            .chunks
+            .iter()
+            .map(|chunk| chunk.retained_bytes)
+            .sum::<usize>();
+        let sidecar_structure_bytes = std::mem::size_of::<codec::DecodeSidecar>()
+            .saturating_add(snapshot.sidecar.order.iter().map(String::len).sum())
+            .saturating_add(snapshot.sidecar.messages.keys().map(String::len).sum())
+            .saturating_add(
+                snapshot
+                    .sidecar
+                    .mid_pins
+                    .iter()
+                    .map(|(key, value)| key.len().saturating_add(value.len()))
+                    .sum(),
+            );
+        let sidecar_bytes = snapshot
+            .sidecar_sizes
+            .values()
+            .copied()
+            .sum::<usize>()
+            .saturating_add(sidecar_structure_bytes);
+        // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
+        // Native sidecar trees are charged on top of the size estimate computed during hashing.
+        let projection_bytes = snapshot
+            .projection
+            .as_deref()
+            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
+        let retained_bytes = encoded_bytes
+            .saturating_add(served_bytes.saturating_mul(2))
+            .saturating_add(sidecar_bytes)
+            .saturating_add(projection_bytes);
+        if retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            NativeAttachmentCacheSession {
+                revert_epoch,
+                retained_bytes,
+                snapshot,
+                stats,
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stats(&self, session_id: &str) -> NativeAttachmentCacheStats {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.stats)
+            .unwrap_or_default()
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -2042,6 +2229,7 @@ pub struct McHandler {
     recomp_sessions: Arc<Mutex<HashSet<String>>>,
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     serialized_outputs: Mutex<SerializedOutputCache>,
+    native_attachments: Mutex<NativeAttachmentCache>,
     boundary_tokens: Mutex<BoundaryTokenCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
@@ -2472,6 +2660,7 @@ impl McHandler {
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
+            native_attachments: Mutex::new(NativeAttachmentCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2564,6 +2753,7 @@ impl McHandler {
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
+            native_attachments: Mutex::new(NativeAttachmentCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2635,6 +2825,10 @@ impl McHandler {
             self.serialized_outputs
                 .lock()
                 .expect("serialized output cache mutex")
+                .remove(&session_id);
+            self.native_attachments
+                .lock()
+                .expect("native attachment cache mutex")
                 .remove(&session_id);
             self.boundary_tokens
                 .lock()
@@ -2713,64 +2907,76 @@ impl McHandler {
         self.refresh_oldest_queued_at_ms();
     }
 
-    /// Reconstruct a full ingress snapshot from the last successful request plus a
-    /// caller-provided tail. The adapter only uses this after the module has acknowledged
-    /// the exact prefix fingerprint, so a missing/restarted cache remains fail-open via
-    /// NEED_FULL_SYNC instead of silently accepting an ambiguous prefix.
-    fn expand_transform_tail_delta(&self, parsed: &mut TransformRequest) -> bool {
-        let Some(delta) = parsed.tail_delta.as_ref().and_then(Value::as_object) else {
-            return false;
-        };
-        let Some(after) = delta.get("after").and_then(Value::as_str) else {
-            return false;
-        };
-        let Some(replace_from) = delta
+    /// Reconstruct a full ingress snapshot from the last successful request plus a validated
+    /// caller tail. The returned native frontier is used only for this request and is never stored
+    /// as authoritative cache state. Native attachment and prefix projection each verify the same
+    /// cache entry and `after` identity before reusing it.
+    fn expand_transform_tail_delta(
+        &self,
+        parsed: &mut TransformRequest,
+    ) -> Option<NativeDeltaFrontier> {
+        let delta = parsed.tail_delta.as_ref().and_then(Value::as_object)?;
+        let after = delta.get("after").and_then(Value::as_str)?.to_string();
+        let replace_from = delta
             .get("replace_from")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-        else {
-            return false;
-        };
-        let Some(native_replace_from) = delta
+            .and_then(|value| usize::try_from(value).ok())?;
+        let native_replace_from = delta
             .get("native_replace_from")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-        else {
-            return false;
-        };
-        if parsed.full_array_fingerprint.is_none() {
-            return false;
-        }
-        let Some(request) = self
+            .and_then(|value| usize::try_from(value).ok())?;
+        parsed.full_array_fingerprint.as_ref()?;
+        let request = self
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
-            .ready_request_clone(&parsed.session_id)
-        else {
-            return false;
-        };
-        if request.full_array_fingerprint.as_deref() != Some(after)
+            .ready_delta_request(&parsed.session_id)?;
+        if request.full_array_fingerprint.as_deref() != Some(after.as_str())
             || replace_from > request.messages.len()
         {
-            return false;
+            return None;
         }
-        let Some(current_native) = parsed.native_messages.take() else {
-            return false;
-        };
-        let Some(previous_native) = request.native_messages.as_ref() else {
-            return false;
-        };
+        // A store-side rewrite can advance the epoch without updating this process's request
+        // snapshot. Load the persisted epoch first, then inspect the shared native/projection
+        // cache, so stale request state cannot select an outdated entry.
+        let current_revert_epoch = self
+            .store
+            .get()?
+            .load(&parsed.session_id)
+            .ok()?
+            .meta
+            .revert_epoch;
+        let projection_cache = self
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex")
+            .snapshot(&parsed.session_id, current_revert_epoch)
+            .and_then(|snapshot| {
+                validated_projection_cache_input(
+                    parsed,
+                    &snapshot,
+                    &after,
+                    replace_from,
+                    ProjectionCacheKeyMode::Normal,
+                )
+            });
+        let mut current_native = parsed.native_messages.take()?;
+        let previous_native = request.native_messages.as_ref()?;
         if native_replace_from > previous_native.len() {
-            return false;
+            return None;
         }
         let mut messages = request.messages[..replace_from].to_vec();
         messages.append(&mut parsed.messages);
         let mut native_messages = previous_native[..native_replace_from].to_vec();
-        native_messages.extend(current_native);
+        native_messages.append(&mut current_native);
         parsed.messages = messages;
         parsed.native_messages = Some(native_messages);
         parsed.tail_delta = None;
-        true
+        Some(NativeDeltaFrontier {
+            after,
+            native_replace_from,
+            projection_cache,
+        })
     }
 
     fn transform_page_in_progress(&self, session_id: &str) -> bool {
@@ -2832,6 +3038,10 @@ impl McHandler {
             self.serialized_outputs
                 .lock()
                 .expect("serialized output cache mutex")
+                .remove(&session);
+            self.native_attachments
+                .lock()
+                .expect("native attachment cache mutex")
                 .remove(&session);
             self.boundary_tokens
                 .lock()
@@ -4531,6 +4741,10 @@ impl McHandler {
             .lock()
             .expect("serialized output cache mutex")
             .remove(&session_id);
+        self.native_attachments
+            .lock()
+            .expect("native attachment cache mutex")
+            .remove(&session_id);
         self.boundary_tokens
             .lock()
             .expect("boundary token cache mutex")
@@ -4547,6 +4761,38 @@ impl McHandler {
                 "ok": true,
                 "disposition": row.disposition,
             })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, binding) = match self.management_binding(channel, request, "session.delete") {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.delete_session(&session_id, &binding.project_root.to_string_lossy()) {
+            Ok(deleted_rows) => {
+                self.reattaching_sessions
+                    .lock()
+                    .expect("reattaching sessions mutex")
+                    .remove(&session_id);
+                self.wrapup_sessions
+                    .lock()
+                    .expect("wrapup sessions mutex")
+                    .remove(&session_id);
+                self.recomp_sessions
+                    .lock()
+                    .expect("recomp sessions mutex")
+                    .remove(&session_id);
+                respond(json!({ "ok": true, "deleted_rows": deleted_rows }))
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "store_write_failed".to_string(),
                 message: error.to_string(),
@@ -4730,6 +4976,7 @@ impl McHandler {
             "compartment_count": compartment_count,
             "compartment_tokens": compartment_tokens,
             "pending_drop_count": pending_drop_count,
+            "tag_count": tag_count,
             "pending_m1_delta": pending_m1_delta,
             "pending_m1_age_ms": pending_m1_age_ms,
             "historian": {
@@ -5811,7 +6058,10 @@ impl McHandler {
             .lock()
             .expect("prompt surface epoch mutex");
         if let Some(frozen) = epochs.get(session_id) {
-            if frozen.model_key == requested.model_key {
+            if frozen.model_key == requested.model_key
+                && prompt_surface::selection_freeze_identity(frozen)
+                    == prompt_surface::selection_freeze_identity(&requested)
+            {
                 return frozen.clone();
             }
         }
@@ -5843,6 +6093,18 @@ impl McHandler {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let config_identity = match request
+            .get("prompt_surface_config_identity")
+            .or_else(|| request.get("config_identity"))
+        {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(value)) => value.trim().to_string(),
+            _ => {
+                return Err(invalid_params_error(
+                    "prompt_surface config identity must be a string",
+                ))
+            }
+        };
         let descriptions = request
             .get("tool_descriptions")
             .or_else(|| request.get("prompt_surface_tool_descriptions"));
@@ -5874,6 +6136,7 @@ impl McHandler {
         }
         Ok(PromptSurfaceSelection {
             model_key,
+            config_identity,
             preset,
             tool_descriptions,
         })
@@ -6196,6 +6459,14 @@ impl McHandler {
         inbound_bytes: Option<usize>,
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
+        let handler_started_at = Instant::now();
+        const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
+        let request_observed_to_handler = request
+            .get(REQUEST_OBSERVED_KEY)
+            .and_then(Value::as_u64)
+            .and_then(|observed| i64::try_from(observed).ok())
+            .map(|observed| now_ms().saturating_sub(observed) as f64)
+            .unwrap_or(0.0);
         let mut parsed: TransformRequest = match serde_json::from_value(request) {
             Ok(req) => req,
             Err(e) => {
@@ -6301,6 +6572,7 @@ impl McHandler {
                 .prompt_surface_model_key
                 .clone()
                 .or_else(|| parsed.model_key.clone()),
+            config_identity: parsed.prompt_surface_config_identity.clone(),
             preset: parsed.prompt_surface_preset,
             tool_descriptions: parsed.prompt_surface_tool_descriptions.clone(),
         };
@@ -6308,6 +6580,7 @@ impl McHandler {
             self.freeze_prompt_surface_selection(&parsed.session_id, requested_prompt_surface);
         parsed.prompt_surface_preset = frozen_prompt_surface.preset;
         parsed.prompt_surface_model_key = frozen_prompt_surface.model_key;
+        parsed.prompt_surface_config_identity = frozen_prompt_surface.config_identity;
         parsed.prompt_surface_tool_descriptions = frozen_prompt_surface.tool_descriptions;
 
         let lineage_root = canonical_root(&binding.project_root);
@@ -6321,9 +6594,14 @@ impl McHandler {
             .entry(binding.session.clone())
             .or_default()
             .insert(lineage_root);
-        if parsed.tail_delta.is_some() && !self.expand_transform_tail_delta(&mut parsed) {
-            return need_full_sync_response(parsed.full_array_fingerprint.clone());
-        }
+        let native_delta_frontier = if parsed.tail_delta.is_some() {
+            let Some(frontier) = self.expand_transform_tail_delta(&mut parsed) else {
+                return need_full_sync_response(parsed.full_array_fingerprint.clone());
+            };
+            Some(frontier)
+        } else {
+            None
+        };
         let parsed = Arc::new(parsed);
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
@@ -6378,6 +6656,19 @@ impl McHandler {
         // change the transform result.
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
         let run_transform = || {
+            let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
+                || {
+                    binding
+                        .config
+                        .resolve_cache_ttl_with_provenance(parsed.model_key.as_deref())
+                },
+                |value| config::ResolvedCacheTtl {
+                    value,
+                    // Host-resolved TTLs remain host-side; only a per-model config match may
+                    // instruct the Claude Code marker owner.
+                    provenance: config::CacheTtlProvenance::Default,
+                },
+            );
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 note_project_path: &note_project_path,
@@ -6397,11 +6688,10 @@ impl McHandler {
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
-                cache_ttl: parsed.cache_ttl.clone().unwrap_or_else(|| {
-                    binding
-                        .config
-                        .resolve_cache_ttl(binding.model_key.as_deref())
-                }),
+                // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
+                // request's model while retaining whether the walk actually matched an entry.
+                cache_ttl: resolved_cache_ttl.value,
+                cache_ttl_provenance: resolved_cache_ttl.provenance,
                 model_key: binding.model_key.clone(),
                 observed_last_response_at_ms: self
                     .observed_last_response_at_ms(&store, &parsed.session_id),
@@ -6421,6 +6711,9 @@ impl McHandler {
                 &parsed,
                 &producer_ctx,
                 &self.serialized_outputs,
+                native_delta_frontier
+                    .as_ref()
+                    .and_then(|frontier| frontier.projection_cache.as_ref()),
             )
         };
         let reject_transform = |e: crate::transform::TransformError| {
@@ -6602,6 +6895,7 @@ impl McHandler {
         let mutation_exempt_mid = result.mutation_exempt_mid;
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
+        let projection = Arc::new(result.projection);
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -6610,8 +6904,8 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
-        if parsed.serve_native {
-            attach_native_messages_with_tags(
+        let native_cache_stats = if parsed.serve_native {
+            attach_native_messages_incremental(
                 &mut response,
                 &parsed,
                 reasoning_watermark,
@@ -6619,8 +6913,15 @@ impl McHandler {
                 mutation_exempt_mid.as_deref(),
                 lineage_anchor_mid.as_deref(),
                 transition_consumed,
-            );
-        }
+                native_delta_frontier.as_ref(),
+                revert_epoch,
+                &self.native_attachments,
+                Some(Arc::clone(&projection)),
+                NativeCacheKeyMode::Normal,
+            )
+        } else {
+            NativeAttachmentCacheStats::default()
+        };
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         // The decoded request retains the same payload represented by its inbound JSON body, so
@@ -6642,8 +6943,12 @@ impl McHandler {
                 retained_bytes,
             );
         if let Some(timings) = response.timings.as_mut() {
+            timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
+            timings.request_observed_to_handler = request_observed_to_handler;
             timings.trigger_ms = trigger_timings.elapsed_ms;
             timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
+            timings.native_cache_reused_messages = native_cache_stats.reused_messages;
+            timings.native_cache_encoded_messages = native_cache_stats.encoded_messages;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
         respond_transform(&parsed.session_id, response)
@@ -7835,13 +8140,17 @@ impl McHandler {
                 Err(error) => Err(error),
             };
             match attempt_output {
-                Ok(result) => {
-                    // The module never parses manifests. A capped result is still returned
-                    // with truncated=true so the host's fail-closed parser remains the
-                    // authority for output validity.
+                Ok(result) if has_manifest_envelope(&result.text) => {
+                    // The module checks only for the task-specific envelope. Even if the
+                    // output limit truncated a result, this layer accepts it when the
+                    // envelope remains; the host parser rejects malformed contents.
                     output = Some((model.clone(), result));
                     producer.purge_session(&child_session).await;
                     break;
+                }
+                Ok(_) => {
+                    last_error =
+                        "classify producer returned no classify manifest envelope".to_string();
                 }
                 Err(error) => last_error = error.to_string(),
             }
@@ -9515,6 +9824,7 @@ impl McHandler {
                 "session.flush" => self.handle_session_flush_value(channel, &request),
                 "session.recomp" => self.handle_session_recomp_value(channel, &request),
                 "session.status" => self.handle_session_status_value(channel, &request),
+                "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
                 // unrecognized body would silently swallow misrouted requests
@@ -9654,11 +9964,26 @@ fn message_tag_numbers(rows: Vec<TagNumberRow>) -> std::collections::BTreeMap<St
     by_message
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCacheKeyMode {
+    Normal,
+    #[cfg(test)]
+    CorruptSidecarForTest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionCacheKeyMode {
+    Normal,
+    #[cfg(test)]
+    CorruptFrontierForTest,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attach_native_messages_with_tags(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
     reasoning_watermark: u64,
-    tag_numbers: &std::collections::BTreeMap<String, u64>,
+    tag_numbers: &BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
     transition_consumed: bool,
@@ -9666,14 +9991,210 @@ fn attach_native_messages_with_tags(
     if !request.serve_native {
         return;
     }
+    let native_messages = encode_full_native_messages(
+        response.messages(),
+        request,
+        reasoning_watermark,
+        tag_numbers,
+        mutation_exempt_mid,
+        lineage_anchor_mid,
+        transition_consumed,
+    );
+    response.native_messages = Some(native_messages.into_iter().map(Arc::new).collect());
+}
+
+fn native_attachment_context(
+    request: &TransformRequest,
+    transition_consumed: bool,
+) -> NativeAttachmentContext {
+    let profile = SerializerProfile::parse(&request.serializer_profile);
+    NativeAttachmentContext {
+        session_id: request.session_id.clone(),
+        serializer_profile: request.serializer_profile.clone(),
+        render_config: request.render_config.clone(),
+        profile_epoch: profile.map(profile_render_epoch).unwrap_or_default(),
+        transition_consumed,
+    }
+}
+
+/// Select the ingress projection using the same immutable cache snapshot that supplies native
+/// attachments.
+///
+/// Include the cached transition salt when comparing cache inputs because a transition found by
+/// the upcoming transform affects served rendering but not the ingress CK projection. Reuse a
+/// cached prefix only when the request's profile and rendering fields also match.
+fn validated_projection_cache_input(
+    request: &TransformRequest,
+    snapshot: &NativeAttachmentCacheSnapshot,
+    after: &str,
+    replace_from: usize,
+    mode: ProjectionCacheKeyMode,
+) -> Option<ProjectionCacheInput> {
+    if snapshot.full_array_fingerprint.as_deref() != Some(after) {
+        return None;
+    }
+    let current_context = native_attachment_context(request, snapshot.context.transition_consumed);
+    if current_context != snapshot.context {
+        return None;
+    }
+    let projection = Arc::clone(snapshot.projection.as_ref()?);
+    #[cfg(test)]
+    let prefix = if mode == ProjectionCacheKeyMode::CorruptFrontierForTest {
+        replace_from.saturating_add(1)
+    } else {
+        replace_from
+    };
+    #[cfg(not(test))]
+    let prefix = {
+        let _ = mode;
+        replace_from
+    };
+    (prefix <= projection.message_count()).then_some(ProjectionCacheInput {
+        projection,
+        replace_from: prefix,
+    })
+}
+
+fn validated_native_prefix(
+    request: &TransformRequest,
+    snapshot: &NativeAttachmentCacheSnapshot,
+    frontier: Option<&NativeDeltaFrontier>,
+) -> usize {
+    let native_len = request.native_messages.as_deref().map_or(0, <[Value]>::len);
+    frontier
+        .filter(|frontier| {
+            Some(frontier.after.as_str()) == snapshot.full_array_fingerprint.as_deref()
+        })
+        .map(|frontier| frontier.native_replace_from)
+        .filter(|replace_from| *replace_from <= native_len)
+        .unwrap_or(0)
+}
+
+fn native_sidecar(
+    request: &TransformRequest,
+    snapshot: Option<&NativeAttachmentCacheSnapshot>,
+    trusted_prefix: usize,
+) -> Arc<codec::DecodeSidecar> {
+    let native_messages = request.native_messages.as_deref().unwrap_or_default();
+    let Some(snapshot) = snapshot else {
+        return Arc::new(codec::decode_opencode(native_messages).sidecar);
+    };
+    if trusted_prefix == native_messages.len() && trusted_prefix == snapshot.sidecar.order.len() {
+        return Arc::clone(&snapshot.sidecar);
+    }
+    if trusted_prefix > 0 && trusted_prefix <= snapshot.sidecar.order.len() {
+        return Arc::new(codec::opencode::decode_opencode_sidecar_incremental(
+            native_messages,
+            &snapshot.sidecar,
+            trusted_prefix,
+        ));
+    }
+    Arc::new(codec::decode_opencode(native_messages).sidecar)
+}
+
+fn native_sidecar_hash_and_size(meta: &codec::sidecar::HarnessMessageMeta) -> ([u8; 32], usize) {
+    let bytes = serde_json::to_vec(meta).expect("OpenCode sidecar metadata must serialize");
+    let retained_bytes = std::mem::size_of_val(meta).saturating_add(bytes.len().saturating_mul(2));
+    (Sha256::digest(&bytes).into(), retained_bytes)
+}
+
+fn native_digest_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_message_key(
+    served: &transform::ServedMessage,
+    position: usize,
+    sidecar_hash: Option<&[u8; 32]>,
+    tag_number: u64,
+    reasoning_should_clear: bool,
+    mutation_exempt: bool,
+    mode: NativeCacheKeyMode,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    let (output_identity, canonical_hash) = served.native_identity_basis();
+    native_digest_field(&mut hasher, output_identity.as_bytes());
+    native_digest_field(&mut hasher, canonical_hash);
+    native_digest_field(&mut hasher, &position.to_le_bytes());
+    #[cfg(test)]
+    let include_sidecar = mode != NativeCacheKeyMode::CorruptSidecarForTest;
+    #[cfg(not(test))]
+    let include_sidecar = {
+        let _ = mode;
+        true
+    };
+    if include_sidecar {
+        native_digest_field(
+            &mut hasher,
+            sidecar_hash.map(|hash| hash.as_slice()).unwrap_or_default(),
+        );
+    }
+    native_digest_field(&mut hasher, &tag_number.to_le_bytes());
+    native_digest_field(&mut hasher, &[reasoning_should_clear as u8]);
+    native_digest_field(&mut hasher, &[mutation_exempt as u8]);
+    hasher.finalize().into()
+}
+
+fn native_value_retained_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
+        Value::String(text) => std::mem::size_of::<Value>().saturating_add(text.len()),
+        Value::Array(values) => std::mem::size_of::<Value>().saturating_add(
+            values
+                .iter()
+                .map(native_value_retained_bytes)
+                .sum::<usize>(),
+        ),
+        Value::Object(object) => std::mem::size_of::<Value>().saturating_add(
+            object
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(native_value_retained_bytes(value)))
+                .sum::<usize>(),
+        ),
+    }
+}
+
+fn native_reasoning_should_clear(
+    served: &transform::ServedMessage,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    newest_assistant_mid: Option<&str>,
+) -> (u64, bool) {
+    let Some(mid) = served.meta.harness_id.as_deref() else {
+        return (0, false);
+    };
+    let Some(ingress) = request.messages.iter().find(|message| message.mid == mid) else {
+        return (0, false);
+    };
+    let tag_number = tag_numbers.get(mid).copied().unwrap_or(ingress.ordinal);
+    let should_clear = served.role == "assistant"
+        && !served.meta.synthetic
+        && reasoning_watermark > 0
+        && transform::request_accepts_empty_content(request)
+        && tag_number <= reasoning_watermark
+        && !(request.mid_turn && newest_assistant_mid == Some(mid));
+    (tag_number, should_clear)
+}
+
+fn encode_full_native_messages(
+    served: &[transform::ServedMessage],
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
+) -> Vec<Value> {
     let sidecar = request
         .native_messages
         .as_deref()
         .map(codec::decode_opencode)
         .map(|decoded| decoded.sidecar)
         .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
-    let served_messages = response
-        .messages()
+    let served_messages = served
         .iter()
         .map(|message| message.deref().clone())
         .collect::<Vec<_>>();
@@ -9700,7 +10221,279 @@ fn attach_native_messages_with_tags(
             tag_numbers,
         );
     }
+    native_messages
+}
+
+static NATIVE_ATTACHMENT_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
+
+fn native_attachment_differential_enabled() -> bool {
+    cfg!(test)
+        || *NATIVE_ATTACHMENT_DIFFERENTIAL.get_or_init(|| {
+            std::env::var("MC_NATIVE_ATTACHMENT_DIFFERENTIAL").as_deref() == Ok("1")
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_native_messages_incremental(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
+    native_delta_frontier: Option<&NativeDeltaFrontier>,
+    revert_epoch: u64,
+    cache: &Mutex<NativeAttachmentCache>,
+    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
+    mode: NativeCacheKeyMode,
+) -> NativeAttachmentCacheStats {
+    if !request.serve_native {
+        return NativeAttachmentCacheStats::default();
+    }
+
+    let cached = cache
+        .lock()
+        .expect("native attachment cache mutex")
+        .snapshot(&request.session_id, revert_epoch);
+    let trusted_prefix = cached
+        .as_ref()
+        .map(|snapshot| validated_native_prefix(request, snapshot, native_delta_frontier))
+        .unwrap_or(0);
+    let sidecar = native_sidecar(request, cached.as_ref(), trusted_prefix);
+    let sidecar_positions = sidecar
+        .order
+        .iter()
+        .enumerate()
+        .map(|(index, mid)| (mid.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let context = native_attachment_context(request, transition_consumed);
+    let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let newest_assistant_mid = request
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .max_by_key(|message| message.ordinal)
+        .map(|message| message.mid.as_str());
+
+    let mut sidecar_hashes = HashMap::new();
+    let mut sidecar_sizes = HashMap::new();
+    let mut message_keys = Vec::with_capacity(response.messages().len());
+    for (position, served) in response.messages().iter().enumerate() {
+        let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
+        let sidecar_hash = meta.map(|meta| {
+            let slot = meta.mid.clone();
+            let trusted = sidecar_positions
+                .get(meta.mid.as_str())
+                .is_some_and(|index| *index < trusted_prefix);
+            let (hash, retained_bytes) = if trusted {
+                cached
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        Some((
+                            *snapshot.sidecar_hashes.get(&slot)?,
+                            *snapshot.sidecar_sizes.get(&slot)?,
+                        ))
+                    })
+                    .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
+            } else {
+                native_sidecar_hash_and_size(meta)
+            };
+            sidecar_hashes.insert(slot.clone(), hash);
+            sidecar_sizes.insert(slot, retained_bytes);
+            hash
+        });
+        let meta_mid = meta.map(|meta| meta.mid.as_str());
+        let mutation_exempt = meta_mid.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
+            served,
+            request,
+            reasoning_watermark,
+            tag_numbers,
+            newest_assistant_mid,
+        );
+        message_keys.push(native_message_key(
+            served,
+            position,
+            sidecar_hash.as_ref(),
+            tag_number,
+            reasoning_should_clear,
+            mutation_exempt,
+            mode,
+        ));
+    }
+    for (slot, meta) in &sidecar.messages {
+        if sidecar_sizes.contains_key(slot) {
+            continue;
+        }
+        let trusted = sidecar_positions
+            .get(slot.as_str())
+            .is_some_and(|index| *index < trusted_prefix);
+        let (hash, retained_bytes) = if trusted {
+            cached
+                .as_ref()
+                .and_then(|snapshot| {
+                    Some((
+                        *snapshot.sidecar_hashes.get(slot)?,
+                        *snapshot.sidecar_sizes.get(slot)?,
+                    ))
+                })
+                .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
+        } else {
+            native_sidecar_hash_and_size(meta)
+        };
+        sidecar_hashes.insert(slot.clone(), hash);
+        sidecar_sizes.insert(slot.clone(), retained_bytes);
+    }
+
+    let cache_compatible = cached
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.context == context);
+    let common = if cache_compatible {
+        cached
+            .as_ref()
+            .expect("compatible native cache has a snapshot")
+            .message_keys
+            .iter()
+            .zip(&message_keys)
+            .take_while(|(previous, current)| previous == current)
+            .count()
+    } else {
+        0
+    };
+    let exact_hit = cache_compatible
+        && cached
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.message_keys.len() == message_keys.len())
+        && common == message_keys.len();
+    let suffix_start = if exact_hit {
+        message_keys.len()
+    } else if common == 0 {
+        0
+    } else {
+        let restart_at = common.saturating_sub(1);
+        cached
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .chunks
+                    .iter()
+                    .find(|chunk| chunk.end_index > restart_at)
+                    .map(|chunk| chunk.start_index)
+            })
+            .unwrap_or(0)
+    };
+
+    let mut chunks = if cache_compatible {
+        cached
+            .as_ref()
+            .expect("compatible native cache has a snapshot")
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.end_index <= suffix_start)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let served_suffix = response.messages()[suffix_start..]
+        .iter()
+        .map(|message| message.deref().clone())
+        .collect::<Vec<_>>();
+    let encoded_suffix = codec::opencode::encode_opencode_chunks_with_transition_state(
+        &served_suffix,
+        &sidecar,
+        Some(&request.session_id),
+        true,
+        &mutation_exempt_mids,
+        transition_consumed,
+        suffix_start,
+    );
+    let mut suffix_values = encoded_suffix
+        .iter()
+        .map(|chunk| chunk.value.clone())
+        .collect::<Vec<_>>();
+    if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
+        transform::clear_served_native_reasoning_from_served(
+            profile,
+            transform::request_accepts_empty_content(request),
+            &mut suffix_values,
+            response.messages(),
+            &request.messages,
+            reasoning_watermark,
+            request.mid_turn,
+            tag_numbers,
+        );
+    }
+    chunks.extend(
+        encoded_suffix
+            .into_iter()
+            .zip(suffix_values)
+            .map(|(chunk, value)| NativeEncodedChunk {
+                start_index: chunk.start_index,
+                end_index: chunk.end_index,
+                retained_bytes: native_value_retained_bytes(&value),
+                value: Arc::new(value),
+            }),
+    );
+    codec::opencode::assert_unique_tool_use_ids(chunks.iter().map(|chunk| chunk.value.as_ref()));
+    let native_messages = chunks
+        .iter()
+        .map(|chunk| Arc::clone(&chunk.value))
+        .collect::<Vec<_>>();
+
+    if native_attachment_differential_enabled() {
+        let full = encode_full_native_messages(
+            response.messages(),
+            request,
+            reasoning_watermark,
+            tag_numbers,
+            mutation_exempt_mid,
+            lineage_anchor_mid,
+            transition_consumed,
+        );
+        let full_bytes = serde_json::to_vec(&full).expect("full native output must serialize");
+        let incremental_bytes =
+            serde_json::to_vec(&native_messages).expect("incremental native output must serialize");
+        assert_eq!(
+            incremental_bytes, full_bytes,
+            "incremental native attachment cache drift"
+        );
+    }
+
+    let stats = NativeAttachmentCacheStats {
+        reused_messages: suffix_start,
+        encoded_messages: message_keys.len().saturating_sub(suffix_start),
+    };
+    let served_bytes = response
+        .messages()
+        .iter()
+        .map(|message| message.canonical_bytes().len())
+        .sum();
+    cache
+        .lock()
+        .expect("native attachment cache mutex")
+        .replace(
+            &request.session_id,
+            revert_epoch,
+            NativeAttachmentCacheSnapshot {
+                context,
+                full_array_fingerprint: request.full_array_fingerprint.clone(),
+                sidecar,
+                message_keys,
+                sidecar_hashes,
+                sidecar_sizes,
+                chunks,
+                projection,
+            },
+            stats,
+            served_bytes,
+        );
     response.native_messages = Some(native_messages);
+    stats
 }
 
 fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
@@ -11313,7 +12106,7 @@ fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
     match block.kind_tag.as_str() {
         "tool_call" => SelKind::ToolCall {
             name: block.name.clone().unwrap_or_default(),
-            input: block.tool_input.clone().unwrap_or(Value::Null),
+            input: block.tool_input.as_deref().cloned().unwrap_or(Value::Null),
         },
         "tool_result" => SelKind::ToolResult {
             tool_name: block.name.clone().unwrap_or_default(),
@@ -13386,6 +14179,45 @@ mod tests {
         call_transform_request(handler, request(messages)).await
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_response_resolves_per_pass_model_cache_ttl_from_module_config() {
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let route_config = config.clone();
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = route_config;
+        handler.bind_route(7, route);
+        let mut transform_request = request(vec![ck("a", 1, "alpha")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+        transform_request["model_key"] = json!("anthropic/claude-opus-4-1");
+
+        let response = call_transform_request(&handler, transform_request).await;
+        assert_eq!(response["cache_ttl"], "1h");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_response_without_model_cache_ttl_inherits_harness_markers() {
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        config.cache_ttl = "90m".to_string();
+        let route_config = config.clone();
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = route_config;
+        handler.bind_route(7, route);
+        let mut transform_request = request(vec![ck("a", 1, "alpha")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+
+        let response = call_transform_request(&handler, transform_request).await;
+        assert!(response.get("cache_ttl").is_none());
+    }
+
     #[test]
     fn cached_transform_response_writer_is_byte_identical_to_value_round_trip() {
         let response = transform::TransformResponse::passthrough(
@@ -13737,6 +14569,13 @@ mod tests {
         assert!(response["timings"]["trigger_ms"].is_number());
         assert_eq!(response["timings"]["trigger_tokenized_blocks"], 1);
         assert!(response["timings"]["post_attach"].is_number());
+        assert!(
+            response["timings"]["handler_total"]
+                .as_f64()
+                .unwrap_or_default()
+                > 0.0
+        );
+        assert!(response["timings"]["request_observed_to_handler"].is_number());
         let warm = call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
         assert_eq!(warm["timings"]["trigger_tokenized_blocks"], 0);
         assert_eq!(
@@ -13791,6 +14630,14 @@ mod tests {
         let second = call_transform_request(&handler, request).await;
         assert_eq!(second["status"], "ok");
         assert_eq!(second["action"], "SOFT+");
+        assert!(
+            second["timings"]["native_cache_reused_messages"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "steady native defer must reuse its encoded prefix"
+        );
+        assert_eq!(second["timings"]["native_cache_encoded_messages"], 0);
         assert_eq!(
             second["native_messages"]
                 .as_array()
@@ -13799,6 +14646,1706 @@ mod tests {
                 .unwrap()["info"]["customInfo"],
             "preserve-me"
         );
+    }
+
+    fn native_cache_request(
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+        native_messages: Vec<Value>,
+        fingerprint: &str,
+    ) -> TransformRequest {
+        serde_json::from_value(json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "opencode-aisdk",
+            "session_id": session_id,
+            "render_config": "cfg0",
+            "provider_id": "anthropic",
+            "serve_native": true,
+            "messages": messages,
+            "native_messages": native_messages,
+            "full_array_fingerprint": fingerprint,
+        }))
+        .unwrap()
+    }
+
+    fn native_text_message(mid: &str, role: &str, text: &str) -> Value {
+        json!({
+            "info": { "id": mid, "role": role },
+            "parts": [{ "type": "text", "text": text }],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_native_cache_pass(
+        cache: &Mutex<NativeAttachmentCache>,
+        request: &TransformRequest,
+        served: Vec<CkWireMessage>,
+        tag_numbers: &BTreeMap<String, u64>,
+        transition_consumed: bool,
+        revert_epoch: u64,
+        mode: NativeCacheKeyMode,
+    ) -> (transform::TransformResponse, NativeAttachmentCacheStats) {
+        run_native_cache_pass_with_watermark(
+            cache,
+            request,
+            served,
+            1,
+            tag_numbers,
+            transition_consumed,
+            revert_epoch,
+            mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_native_cache_pass_with_watermark(
+        cache: &Mutex<NativeAttachmentCache>,
+        request: &TransformRequest,
+        served: Vec<CkWireMessage>,
+        reasoning_watermark: u64,
+        tag_numbers: &BTreeMap<String, u64>,
+        transition_consumed: bool,
+        revert_epoch: u64,
+        mode: NativeCacheKeyMode,
+    ) -> (transform::TransformResponse, NativeAttachmentCacheStats) {
+        let mut response = transform::TransformResponse::passthrough(
+            served,
+            request.full_array_fingerprint.clone(),
+        );
+        let native_delta_frontier = request
+            .tail_delta
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|delta| {
+                Some(NativeDeltaFrontier {
+                    after: delta.get("after")?.as_str()?.to_string(),
+                    native_replace_from: usize::try_from(
+                        delta.get("native_replace_from")?.as_u64()?,
+                    )
+                    .ok()?,
+                    projection_cache: None,
+                })
+            });
+        let stats = attach_native_messages_incremental(
+            &mut response,
+            request,
+            reasoning_watermark,
+            tag_numbers,
+            None,
+            None,
+            transition_consumed,
+            native_delta_frontier.as_ref(),
+            revert_epoch,
+            cache,
+            Some(Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("native cache test projection must succeed"),
+            )),
+            mode,
+        );
+        (response, stats)
+    }
+
+    fn seed_handler_delta_snapshot(
+        handler: &McHandler,
+        request: &TransformRequest,
+        revert_epoch: u64,
+    ) {
+        let served = request
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        run_native_cache_pass(
+            &handler.native_attachments,
+            request,
+            served,
+            &BTreeMap::new(),
+            false,
+            revert_epoch,
+            NativeCacheKeyMode::Normal,
+        );
+        let retained_bytes = serde_json::to_vec(request).unwrap().len();
+        let mut snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let generation = snapshots.begin(&request.session_id);
+        snapshots.finish_ready(
+            &request.session_id,
+            generation,
+            Arc::new(request.clone()),
+            revert_epoch,
+            retained_bytes,
+        );
+    }
+
+    #[test]
+    fn incremental_native_cache_replays_complex_prefix_and_encodes_only_tail() {
+        let todo = injection::build_synthetic_todo_pair(
+            r#"[{"content":"Keep the pair","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let frozen_call = assistant_tool_call("call-frozen", 1);
+        let frozen_result = tool_result("result-frozen", 2, "[dropped]");
+        let reasoning = ck_reasoning("assistant-old", 3, "signed historical thinking");
+        let user = ck("user-one", 4, "prompt");
+        let mut served = vec![
+            CkWireMessage::synthetic_user_text("frozen m0".to_string()),
+            todo.assistant_msg,
+            todo.tool_msg,
+            frozen_call.ck.clone(),
+            frozen_result.ck.clone(),
+            reasoning.ck.clone(),
+            user.ck.clone(),
+        ];
+        let native = vec![
+            json!({
+                "info": { "id": "assistant-old", "role": "assistant" },
+                "parts": [
+                    { "type": "reasoning", "text": "signed historical thinking", "metadata": { "signature": "sig" } },
+                    { "type": "compaction", "summary": "keep marker representation" }
+                ]
+            }),
+            native_text_message("user-one", "user", "prompt"),
+        ];
+        let messages = vec![frozen_call, frozen_result, reasoning, user];
+        let first_request =
+            native_cache_request("native-complex", messages.clone(), native.clone(), "fp-1");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let tags = BTreeMap::from([("assistant-old".to_string(), 1)]);
+        let (_first, first_stats) = run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &tags,
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(first_stats.reused_messages, 0);
+
+        let appended = ck("user-two", 5, "second prompt");
+        served.push(appended.ck.clone());
+        let mut next_messages = messages;
+        next_messages.push(appended);
+        let mut next_native = native;
+        next_native.push(native_text_message("user-two", "user", "second prompt"));
+        let mut second_request =
+            native_cache_request("native-complex", next_messages, next_native, "fp-2");
+        second_request.tail_delta = Some(json!({
+            "after": "fp-1",
+            "replace_from": 4,
+            "native_replace_from": 2,
+        }));
+        let (second, second_stats) = run_native_cache_pass(
+            &cache,
+            &second_request,
+            served,
+            &tags,
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(second_stats.reused_messages >= 5, "{second_stats:?}");
+        assert!(second_stats.encoded_messages <= 2, "{second_stats:?}");
+        let native = second.native_messages.expect("incremental native output");
+        let encoded = serde_json::to_string(&native).unwrap();
+        assert!(encoded.contains("syntheticTodoMarker"));
+        assert!(encoded.contains("keep marker representation"));
+        assert!(encoded.contains("[dropped]"));
+        assert!(native.iter().any(|message| {
+            message["parts"].as_array().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part["type"] == json!("reasoning") && part["text"] == json!(""))
+            })
+        }));
+        assert_eq!(cache.lock().unwrap().stats("native-complex"), second_stats);
+    }
+
+    #[test]
+    fn incremental_native_cache_invalidates_every_byte_affecting_input() {
+        let ingress = vec![ck("m1", 1, "one"), ck("m2", 2, "two"), ck("m3", 3, "three")];
+        let native = vec![
+            native_text_message("m1", "user", "one"),
+            native_text_message("m2", "user", "two"),
+            native_text_message("m3", "user", "three"),
+        ];
+        let baseline_request =
+            native_cache_request("native-invalidations", ingress.clone(), native, "fp-base");
+        let baseline_served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+
+        for trigger in [
+            "fold",
+            "coverage",
+            "reduction",
+            "transition_salt",
+            "render_epoch",
+            "revert_epoch",
+            "tag_mutation",
+            "sidecar_meta",
+            "profile",
+        ] {
+            let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+            run_native_cache_pass(
+                &cache,
+                &baseline_request,
+                baseline_served.clone(),
+                &BTreeMap::new(),
+                false,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            let mut request = baseline_request.clone();
+            let mut served = baseline_served.clone();
+            let mut tags = BTreeMap::new();
+            let mut transition_consumed = false;
+            let mut revert_epoch = 0;
+            match trigger {
+                "fold" => {
+                    served[0] = CkWireMessage::synthetic_user_text("folded prefix".to_string());
+                }
+                "coverage" => {
+                    served.remove(0);
+                }
+                "reduction" => {
+                    served[2].content[0] = CkWireBlock::bare(CkKind::Text {
+                        text: "[dropped]".to_string(),
+                    });
+                    served[2].mark_modified();
+                }
+                "transition_salt" => transition_consumed = true,
+                "render_epoch" => request.render_config = "cfg1".to_string(),
+                "revert_epoch" => revert_epoch = 1,
+                "tag_mutation" => {
+                    tags.insert("m3".to_string(), 7);
+                }
+                "sidecar_meta" => {
+                    request.native_messages.as_mut().unwrap()[2]["info"]["custom"] = json!(true);
+                }
+                "profile" => request.serializer_profile = "opencode-aisdk-next".to_string(),
+                _ => unreachable!(),
+            }
+            let (_response, stats) = run_native_cache_pass(
+                &cache,
+                &request,
+                served,
+                &tags,
+                transition_consumed,
+                revert_epoch,
+                NativeCacheKeyMode::Normal,
+            );
+            assert!(
+                stats.encoded_messages > 0,
+                "{trigger} did not invalidate the native cache: {stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_transition_class_sets_invalidate_with_consumed_boolean_stable() {
+        let reasoning = ck_reasoning("transition-reasoning", 1, "signed");
+        let call = assistant_tool_call("call-transition", 2);
+        let result = tool_result("result-transition", 3, "result");
+        let tail = ck("transition-tail", 4, "tail");
+        let todo = injection::build_synthetic_todo_pair(
+            r#"[{"content":"transition","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let baseline_ingress = vec![
+            reasoning.clone(),
+            call.clone(),
+            result.clone(),
+            tail.clone(),
+        ];
+        let baseline = vec![
+            reasoning.ck,
+            call.ck,
+            result.ck,
+            tail.ck,
+            todo.assistant_msg,
+            todo.tool_msg,
+        ];
+        let request = native_cache_request(
+            "native-transition-classes",
+            baseline_ingress,
+            Vec::new(),
+            "transition-fp",
+        );
+
+        for class_set in [
+            "poisoned_reasoning",
+            "unmatched_pair",
+            "split_coverage",
+            "synthetic_anchor_split",
+            "poisoned_reasoning+synthetic_anchor_split",
+        ] {
+            let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+            run_native_cache_pass(
+                &cache,
+                &request,
+                baseline.clone(),
+                &BTreeMap::new(),
+                true,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            let mut changed = baseline.clone();
+            match class_set {
+                "poisoned_reasoning" => {
+                    changed[0].content[0] = CkWireBlock::bare(CkKind::Text {
+                        text: String::new(),
+                    });
+                    changed[0].mark_modified();
+                }
+                "unmatched_pair" => {
+                    if let CkKind::ToolResult { id, .. } = &mut changed[2].content[0].kind {
+                        *id = "call-transition-unmatched".to_string();
+                    }
+                    changed[2].mark_modified();
+                }
+                "split_coverage" => {
+                    changed.remove(1);
+                }
+                "synthetic_anchor_split" => {
+                    let result = changed.pop().unwrap();
+                    let call = changed.pop().unwrap();
+                    changed.insert(3, call);
+                    changed.insert(4, result);
+                }
+                "poisoned_reasoning+synthetic_anchor_split" => {
+                    changed[0].content[0] = CkWireBlock::bare(CkKind::Text {
+                        text: String::new(),
+                    });
+                    changed[0].mark_modified();
+                    let result = changed.pop().unwrap();
+                    let call = changed.pop().unwrap();
+                    changed.insert(3, call);
+                    changed.insert(4, result);
+                }
+                _ => unreachable!(),
+            }
+            let (_response, stats) = run_native_cache_pass(
+                &cache,
+                &request,
+                changed,
+                &BTreeMap::new(),
+                true,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            assert!(
+                stats.encoded_messages > 0,
+                "transition class set {class_set} reused stale native bytes"
+            );
+        }
+    }
+
+    fn rewrite_first_tool_result(messages: &mut [CkWireMessage], text: &str) {
+        let block = messages
+            .iter_mut()
+            .flat_map(|message| message.content.iter_mut())
+            .find(|block| matches!(block.kind, CkKind::ToolResult { .. }))
+            .expect("tool result block");
+        let CkKind::ToolResult { output, .. } = &mut block.kind else {
+            unreachable!()
+        };
+        *output = CkToolOutput::bare(CkOutputKind::Text {
+            text: text.to_string(),
+        });
+        block.mark_modified();
+    }
+
+    #[test]
+    fn reduced_shell_rematches_across_three_incremental_sidecar_generations() {
+        let raw_tool = json!({
+            "info": { "id": "shell", "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "callID": "call-shell",
+                "tool": "bash",
+                "state": { "status": "completed", "input": {}, "output": "original" }
+            }]
+        });
+        let decoded = codec::decode_opencode(std::slice::from_ref(&raw_tool));
+        let mut served = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        rewrite_first_tool_result(&mut served, "[dropped gen1]");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let first_request = native_cache_request(
+            "native-shell-rematch",
+            decoded.messages.clone(),
+            vec![raw_tool.clone()],
+            "shell-fp-1",
+        );
+        run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let user_2 = ck("shell-user-2", 2, "second");
+        served.push(user_2.ck.clone());
+        let mut generation_2_messages = decoded.messages.clone();
+        generation_2_messages.push(user_2);
+        let mut generation_2_native = vec![raw_tool.clone()];
+        generation_2_native.push(native_text_message("shell-user-2", "user", "second"));
+        let mut generation_2 = native_cache_request(
+            "native-shell-rematch",
+            generation_2_messages,
+            generation_2_native,
+            "shell-fp-2",
+        );
+        generation_2.tail_delta = Some(json!({
+            "after": "shell-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        rewrite_first_tool_result(&mut served, "[dropped gen2]");
+        run_native_cache_pass(
+            &cache,
+            &generation_2,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let user_3 = ck("shell-user-3", 3, "third");
+        served.push(user_3.ck.clone());
+        let mut generation_3_messages = generation_2.messages.clone();
+        generation_3_messages.push(user_3);
+        let mut generation_3_native = generation_2.native_messages.clone().unwrap();
+        generation_3_native.push(native_text_message("shell-user-3", "user", "third"));
+        let mut generation_3 = native_cache_request(
+            "native-shell-rematch",
+            generation_3_messages,
+            generation_3_native,
+            "shell-fp-3",
+        );
+        generation_3.tail_delta = Some(json!({
+            "after": "shell-fp-2",
+            "replace_from": 2,
+            "native_replace_from": 2,
+        }));
+        rewrite_first_tool_result(&mut served, "[dropped gen3]");
+        let (response, _stats) = run_native_cache_pass(
+            &cache,
+            &generation_3,
+            served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let native = response.native_messages.unwrap();
+        let shell = native
+            .iter()
+            .find(|message| message["info"]["id"] == "shell")
+            .expect("rematched shell");
+        assert_eq!(shell["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(shell["parts"][0]["callID"], "call-shell");
+        assert_eq!(shell["parts"][0]["state"]["output"], "[dropped gen3]");
+    }
+
+    #[test]
+    fn marker_representation_reconciles_after_changed_native_frontier() {
+        let first_native = vec![
+            native_text_message("marker-1", "user", "one"),
+            native_text_message("marker-2", "user", "two"),
+            json!({
+                "info": { "id": "marker-3", "role": "assistant" },
+                "parts": [
+                    { "type": "text", "text": "three" },
+                    { "type": "compaction", "summary": "marker-v1", "custom": 1 }
+                ]
+            }),
+        ];
+        let decoded = codec::decode_opencode(&first_native);
+        let served = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let first_request = native_cache_request(
+            "native-marker-frontier",
+            decoded.messages.clone(),
+            first_native.clone(),
+            "marker-fp-1",
+        );
+        run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut changed_native = first_native;
+        changed_native[2]["parts"][1]["summary"] = json!("marker-v2");
+        changed_native[2]["parts"][1]["custom"] = json!(2);
+        let mut changed_request = native_cache_request(
+            "native-marker-frontier",
+            decoded.messages,
+            changed_native,
+            "marker-fp-2",
+        );
+        changed_request.tail_delta = Some(json!({
+            "after": "marker-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 2,
+        }));
+        let (response, stats) = run_native_cache_pass(
+            &cache,
+            &changed_request,
+            served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.reused_messages > 0, "{stats:?}");
+        let marker = response
+            .native_messages
+            .unwrap()
+            .into_iter()
+            .find(|message| message["info"]["id"] == "marker-3")
+            .unwrap();
+        assert_eq!(marker["parts"][1]["summary"], "marker-v2");
+        assert_eq!(marker["parts"][1]["custom"], 2);
+    }
+
+    #[test]
+    fn newest_reasoning_becomes_historical_after_watermark_tail_advance() {
+        let first_ingress = vec![ck_reasoning("reasoning-1", 1, "signed-1")];
+        let first_native = vec![json!({
+            "info": { "id": "reasoning-1", "role": "assistant" },
+            "parts": [{ "type": "reasoning", "text": "signed-1", "metadata": { "signature": "sig-1" } }]
+        })];
+        let mut first_request = native_cache_request(
+            "native-reasoning-movement",
+            first_ingress.clone(),
+            first_native.clone(),
+            "reasoning-fp-1",
+        );
+        first_request.mid_turn = true;
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let (first, _) = run_native_cache_pass_with_watermark(
+            &cache,
+            &first_request,
+            vec![first_ingress[0].ck.clone()],
+            0,
+            &BTreeMap::from([("reasoning-1".to_string(), 1)]),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            first.native_messages.unwrap()[0]["parts"][0]["text"],
+            "signed-1"
+        );
+
+        let newest = ck_reasoning("reasoning-2", 2, "signed-2");
+        let mut second_ingress = first_ingress;
+        second_ingress.push(newest.clone());
+        let mut second_native = first_native;
+        second_native.push(json!({
+            "info": { "id": "reasoning-2", "role": "assistant" },
+            "parts": [{ "type": "reasoning", "text": "signed-2", "metadata": { "signature": "sig-2" } }]
+        }));
+        let mut second_request = native_cache_request(
+            "native-reasoning-movement",
+            second_ingress.clone(),
+            second_native,
+            "reasoning-fp-2",
+        );
+        second_request.mid_turn = true;
+        second_request.tail_delta = Some(json!({
+            "after": "reasoning-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let (second, stats) = run_native_cache_pass_with_watermark(
+            &cache,
+            &second_request,
+            second_ingress
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            1,
+            &BTreeMap::from([
+                ("reasoning-1".to_string(), 1),
+                ("reasoning-2".to_string(), 2),
+            ]),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.encoded_messages > 0);
+        let native = second.native_messages.unwrap();
+        assert_eq!(
+            native[0]["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
+        assert_eq!(native[1]["parts"][0]["text"], "signed-2");
+    }
+
+    #[test]
+    fn frontier_vacuity_covers_opaque_repeats_eviction_and_same_length_edits() {
+        let baseline_ingress = vec![ck("frontier-1", 1, "aaa"), ck("frontier-2", 2, "bbb")];
+        let baseline_native = vec![
+            json!({ "info": { "id": "frontier-1", "role": "user", "meta": "aaa" }, "parts": [{ "type": "text", "text": "aaa" }] }),
+            json!({ "info": { "id": "frontier-2", "role": "user", "meta": "bbb" }, "parts": [{ "type": "text", "text": "bbb" }] }),
+        ];
+        let baseline_request = native_cache_request(
+            "native-frontier-vacuity",
+            baseline_ingress.clone(),
+            baseline_native,
+            "opaque-repeat",
+        );
+        let baseline_served = baseline_ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &baseline_request,
+            baseline_served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut edited_request = baseline_request.clone();
+        edited_request.messages[1] = ck("frontier-2", 2, "ccc");
+        edited_request.native_messages.as_mut().unwrap()[1]["info"]["meta"] = json!("ccc");
+        edited_request.native_messages.as_mut().unwrap()[1]["parts"][0]["text"] = json!("ccc");
+        let mut edited_served = baseline_served;
+        edited_served[1] = edited_request.messages[1].ck.clone();
+        let (edited, stats) = run_native_cache_pass(
+            &cache,
+            &edited_request,
+            edited_served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.encoded_messages > 0, "same-length edit was reused");
+        assert_eq!(edited.native_messages.unwrap()[1]["info"]["meta"], "ccc");
+
+        let evicting_cache = Mutex::new(NativeAttachmentCache::new(1));
+        run_native_cache_pass(
+            &evicting_cache,
+            &edited_request,
+            edited_served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let (_after_eviction, evicted_stats) = run_native_cache_pass(
+            &evicting_cache,
+            &edited_request,
+            edited_served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(evicted_stats.reused_messages, 0);
+        assert!(evicted_stats.encoded_messages > 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental native attachment cache drift")]
+    fn differential_assert_rejects_frontier_inside_mutated_native_region() {
+        let ingress = vec![ck("inside-1", 1, "one"), ck("inside-2", 2, "two")];
+        let native = vec![
+            native_text_message("inside-1", "user", "one"),
+            native_text_message("inside-2", "user", "two"),
+        ];
+        let first_request = native_cache_request(
+            "native-inside-frontier",
+            ingress.clone(),
+            native,
+            "inside-fp-1",
+        );
+        let served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut malformed = first_request;
+        malformed.full_array_fingerprint = Some("inside-fp-2".to_string());
+        malformed.native_messages.as_mut().unwrap()[0]["info"]["custom"] =
+            json!("mutated-before-frontier");
+        malformed.tail_delta = Some(json!({
+            "after": "inside-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 1,
+        }));
+        run_native_cache_pass(
+            &cache,
+            &malformed,
+            served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental native attachment cache drift")]
+    fn differential_assert_catches_corrupt_sidecar_key_derivation() {
+        let ingress = vec![ck("m1", 1, "one")];
+        let request = native_cache_request(
+            "native-key-mutation",
+            ingress.clone(),
+            vec![native_text_message("m1", "user", "one")],
+            "fp-1",
+        );
+        let served = vec![ingress[0].ck.clone()];
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            served.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::CorruptSidecarForTest,
+        );
+
+        let mut mutated = request;
+        mutated.native_messages.as_mut().unwrap()[0]["info"]["custom"] = json!("changed");
+        run_native_cache_pass(
+            &cache,
+            &mutated,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::CorruptSidecarForTest,
+        );
+    }
+
+    #[test]
+    fn projected_prefix_is_charged_to_the_shared_native_lru_budget() {
+        let ingress = vec![ck("budget-projection", 1, &"x".repeat(4096))];
+        let request = native_cache_request(
+            "projection-budget",
+            ingress.clone(),
+            vec![native_text_message(
+                "budget-projection",
+                "user",
+                &"x".repeat(4096),
+            )],
+            "projection-budget-fp",
+        );
+        let served = vec![ingress[0].ck.clone()];
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages)
+                .expect("budget projection must succeed"),
+        );
+        let without_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut without_response = transform::TransformResponse::passthrough(
+            served.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        attach_native_messages_incremental(
+            &mut without_response,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &without_projection,
+            None,
+            NativeCacheKeyMode::Normal,
+        );
+        let without_charge = without_projection
+            .lock()
+            .expect("native attachment cache mutex")
+            .retained_bytes;
+
+        let with_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut with_response = transform::TransformResponse::passthrough(
+            served,
+            request.full_array_fingerprint.clone(),
+        );
+        attach_native_messages_incremental(
+            &mut with_response,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &with_projection,
+            Some(Arc::clone(&projection)),
+            NativeCacheKeyMode::Normal,
+        );
+        let with_charge = with_projection
+            .lock()
+            .expect("native attachment cache mutex")
+            .retained_bytes;
+        assert_eq!(
+            with_charge.saturating_sub(without_charge),
+            projection.retained_bytes()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_small_lru_evicts_projection_and_attachment_together_then_runs_cold() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let session_a = "projection-lru-a";
+        let session_b = "projection-lru-b";
+        let session_c = "projection-lru-oversized";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session_a));
+        handler.bind_route(8, binding(project.to_str().unwrap(), session_b));
+        handler.bind_route(9, binding(project.to_str().unwrap(), session_c));
+
+        let initial_a = native_cache_request(
+            session_a,
+            vec![
+                ck("lru-a-prefix", 1, &"a".repeat(4096)),
+                ck("lru-a-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "lru-a-fp-1",
+        );
+        let response_a = call_transform_request_on_channel(
+            &handler,
+            7,
+            serde_json::to_value(initial_a).unwrap(),
+        )
+        .await;
+        assert_eq!(response_a["status"], "ok", "{response_a}");
+        let (entry_charge, projection_weak, attachment_weak) = {
+            let mut cache = handler.native_attachments.lock().unwrap();
+            let entry = &cache.sessions[session_a];
+            let projection = entry.snapshot.projection.as_ref().unwrap();
+            let chunk = entry
+                .snapshot
+                .chunks
+                .first()
+                .expect("encoded attachment chunk");
+            let values = (
+                entry.retained_bytes,
+                Arc::downgrade(projection),
+                Arc::downgrade(&chunk.value),
+            );
+            cache.max_retained_bytes = entry.retained_bytes;
+            values
+        };
+
+        let initial_b = native_cache_request(
+            session_b,
+            vec![
+                ck("lru-b-prefix", 1, &"b".repeat(4096)),
+                ck("lru-b-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "lru-b-fp-1",
+        );
+        let response_b = call_transform_request_on_channel(
+            &handler,
+            8,
+            serde_json::to_value(initial_b).unwrap(),
+        )
+        .await;
+        assert_eq!(response_b["status"], "ok", "{response_b}");
+        {
+            let cache = handler.native_attachments.lock().unwrap();
+            assert!(!cache.sessions.contains_key(session_a));
+            assert!(cache.sessions.contains_key(session_b));
+        }
+        assert!(projection_weak.upgrade().is_none());
+        assert!(attachment_weak.upgrade().is_none());
+
+        assert!(entry_charge > 1);
+        handler
+            .native_attachments
+            .lock()
+            .unwrap()
+            .max_retained_bytes = entry_charge - 1;
+        let oversized = native_cache_request(
+            session_c,
+            vec![
+                ck("lru-c-prefix", 1, &"c".repeat(4096)),
+                ck("lru-c-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "lru-c-fp-1",
+        );
+        let response_c = call_transform_request_on_channel(
+            &handler,
+            9,
+            serde_json::to_value(oversized).unwrap(),
+        )
+        .await;
+        assert_eq!(response_c["status"], "ok", "{response_c}");
+        assert!(!handler
+            .native_attachments
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(session_c));
+
+        let mut cold_delta = native_cache_request(
+            session_a,
+            vec![ck("lru-a-tail", 2, "after")],
+            Vec::new(),
+            "lru-a-fp-2",
+        );
+        cold_delta.tail_delta = Some(json!({
+            "after": "lru-a-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let cold = call_transform_request_on_channel(
+            &handler,
+            7,
+            serde_json::to_value(cold_delta).unwrap(),
+        )
+        .await;
+        assert_eq!(cold["status"], "ok", "{cold}");
+        assert_eq!(cold["timings"]["projection_reused_messages"], 0);
+        assert_eq!(cold["timings"]["projection_projected_messages"], 2);
+        assert_eq!(cold["timings"]["native_cache_reused_messages"], 0);
+        assert!(
+            cold["timings"]["native_cache_encoded_messages"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental prefix projection byte drift")]
+    fn projection_differential_catches_corrupt_first_changed_position() {
+        let ingress = vec![ck("p1", 1, "one"), ck("p2", 2, "two")];
+        let request = native_cache_request(
+            "projection-key-mutation",
+            ingress.clone(),
+            vec![
+                native_text_message("p1", "user", "one"),
+                native_text_message("p2", "user", "two"),
+            ],
+            "projection-fp-1",
+        );
+        let served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let snapshot = cache
+            .lock()
+            .expect("native attachment cache mutex")
+            .snapshot(&request.session_id, 0)
+            .expect("projection cache snapshot");
+        let mut changed = request;
+        changed.messages[1] = ck("p2", 2, "changed");
+        changed.full_array_fingerprint = Some("projection-fp-2".to_string());
+        let corrupt = validated_projection_cache_input(
+            &changed,
+            &snapshot,
+            "projection-fp-1",
+            1,
+            ProjectionCacheKeyMode::CorruptFrontierForTest,
+        )
+        .expect("corrupt projection cache key");
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &changed.messages,
+            &corrupt.projection,
+            corrupt.replace_from,
+        )
+        .expect("corrupt incremental projection still parses");
+        transform::assert_prefix_projection_equivalent(&incremental, &changed.messages).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "OpenCode serialization produced duplicate tool_use ids")]
+    fn duplicate_tool_use_assert_covers_incremental_native_suffix() {
+        let text = ck("lead", 1, "lead");
+        let call = assistant_tool_call("call-dup", 2);
+        let result = tool_result("result-dup", 3, "first");
+        let baseline = vec![text.clone(), call.clone(), result.clone()];
+        let request = native_cache_request("native-dup", baseline.clone(), Vec::new(), "fp-1");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            baseline.iter().map(|message| message.ck.clone()).collect(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut duplicate_call = call;
+        duplicate_call.mid = "call-dup-again".to_string();
+        duplicate_call.ck.meta.harness_id = Some(duplicate_call.mid.clone());
+        let mut duplicate_result = result;
+        duplicate_result.mid = "result-dup-again".to_string();
+        duplicate_result.ck.meta.harness_id = Some(duplicate_result.mid.clone());
+        let mut next = baseline;
+        next.push(duplicate_call);
+        next.push(duplicate_result);
+        let mut next_request = native_cache_request("native-dup", next.clone(), Vec::new(), "fp-2");
+        next_request.tail_delta = Some(json!({
+            "after": "fp-1",
+            "replace_from": 3,
+            "native_replace_from": 0,
+        }));
+        run_native_cache_pass(
+            &cache,
+            &next_request,
+            next.iter().map(|message| message.ck.clone()).collect(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_tail_delta_cross_frontier_tool_arc_matches_full_control() {
+        let (cached_handler, cached_store, _cached_dir, _cached_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let (control_handler, control_store, _control_dir, _control_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let initial_messages = vec![
+            ck_reasoning("reasoning-old", 1, "signed reasoning"),
+            assistant_tool_call("call-project", 2),
+            tool_result("result-project", 3, "first result"),
+        ];
+        for handler in [&cached_handler, &control_handler] {
+            let initial = native_cache_request(
+                "ses",
+                initial_messages.clone(),
+                Vec::new(),
+                "projection-handler-fp-1",
+            );
+            let response =
+                call_transform_request(handler, serde_json::to_value(initial).unwrap()).await;
+            assert_eq!(response["status"], "ok", "{response}");
+        }
+
+        let changed_messages = vec![
+            ck_reasoning("reasoning-old", 1, "signed reasoning"),
+            assistant_tool_call("call-project", 2),
+            tool_result("result-project", 3, "changed result"),
+        ];
+        let mut delta = native_cache_request(
+            "ses",
+            vec![changed_messages[2].clone()],
+            Vec::new(),
+            "projection-handler-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "projection-handler-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        }));
+        let cached =
+            call_transform_request(&cached_handler, serde_json::to_value(delta).unwrap()).await;
+        let full = call_transform_request(
+            &control_handler,
+            serde_json::to_value(native_cache_request(
+                "ses",
+                changed_messages,
+                Vec::new(),
+                "projection-handler-fp-2",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(cached["status"], "ok", "{cached}");
+        assert_eq!(full["status"], "ok", "{full}");
+        assert_eq!(cached["timings"]["projection_reused_messages"], 2);
+        assert_eq!(cached["timings"]["projection_projected_messages"], 1);
+        assert_eq!(full["timings"]["projection_reused_messages"], 0);
+        assert_eq!(full["timings"]["projection_projected_messages"], 3);
+
+        for field in [
+            "action",
+            "decision",
+            "materialize_reason",
+            "boundary_id",
+            "coverage_ordinal",
+            "historian",
+            "ck_messages",
+            "native_messages",
+        ] {
+            assert_eq!(cached[field], full[field], "full-control drift in {field}");
+        }
+        let result = cached["ck_messages"]
+            .as_array()
+            .expect("CK response array")
+            .iter()
+            .find(|message| message["meta"]["harness_id"] == "result-project")
+            .expect("changed result message");
+        assert_eq!(
+            result["content"][0]["kind"]["output"]["kind"]["text"],
+            "changed result"
+        );
+        codec::opencode::assert_unique_tool_use_ids(
+            cached["native_messages"]
+                .as_array()
+                .expect("native response array")
+                .iter(),
+        );
+
+        let cached_projection = cached_handler
+            .native_attachments
+            .lock()
+            .expect("cached native attachment mutex")
+            .snapshot("ses", cached_store.load("ses").unwrap().meta.revert_epoch)
+            .and_then(|snapshot| snapshot.projection)
+            .expect("cached projection snapshot");
+        let full_projection = control_handler
+            .native_attachments
+            .lock()
+            .expect("control native attachment mutex")
+            .snapshot("ses", control_store.load("ses").unwrap().meta.revert_epoch)
+            .and_then(|snapshot| snapshot.projection)
+            .expect("full projection snapshot");
+        assert_eq!(cached_projection, full_projection);
+        assert_eq!(
+            cached_projection.differential_bytes(),
+            full_projection.differential_bytes(),
+            "projected bytes must match the full control"
+        );
+        let cached_state = cached_store.load("ses").unwrap();
+        let full_state = control_store.load("ses").unwrap();
+        assert_eq!(cached_state.core, full_state.core, "selection/core drift");
+        assert_eq!(
+            cached_state.meta.historian, full_state.meta.historian,
+            "historian boundary math drift"
+        );
+
+        let mut changed_context = native_cache_request(
+            "ses",
+            vec![tool_result("result-project", 3, "changed again")],
+            Vec::new(),
+            "projection-handler-fp-3",
+        );
+        changed_context.render_config = "cfg1".to_string();
+        changed_context.tail_delta = Some(json!({
+            "after": "projection-handler-fp-2",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        }));
+        let third = call_transform_request(
+            &cached_handler,
+            serde_json::to_value(changed_context).unwrap(),
+        )
+        .await;
+        assert_eq!(third["status"], "ok", "{third}");
+        assert_eq!(third["timings"]["projection_reused_messages"], 0);
+        assert_eq!(third["timings"]["projection_projected_messages"], 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_rechecks_durable_revert_epoch_before_projection_reuse() {
+        let session = "projection-revert-epoch";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        let initial = native_cache_request(
+            session,
+            vec![
+                ck("epoch-prefix", 1, "prefix"),
+                ck("epoch-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "epoch-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+        let loaded = store.load(session).unwrap();
+        let mut bumped = loaded.meta.clone();
+        bumped.revert_epoch = bumped.revert_epoch.saturating_add(1);
+        store
+            .commit(session, loaded.row_version, &loaded.core, &bumped)
+            .unwrap();
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("epoch-tail", 2, "after")],
+            Vec::new(),
+            "epoch-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "epoch-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let response = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["timings"]["projection_reused_messages"], 0);
+        assert_eq!(response["timings"]["projection_projected_messages"], 2);
+        let cache = handler
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex");
+        assert_eq!(cache.sessions[session].revert_epoch, bumped.revert_epoch);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_reconcile_recut_refreshes_projection_epoch_and_frontier() {
+        let session = "projection-reconcile-recut";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        store
+            .replace_compartments(
+                session,
+                &[
+                    stored_comp(1, 1, 1, "a", "S0"),
+                    stored_comp(2, 2, 2, "t2", "S1"),
+                ],
+            )
+            .unwrap();
+        let initial_messages = vec![
+            ck("a", 1, "raw"),
+            ck("t2", 2, "turn two"),
+            ck("t3", 3, "tail"),
+        ];
+        let initial = native_cache_request(session, initial_messages, Vec::new(), "reconcile-fp-1");
+        let boot = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(boot["action"], "HARD", "{boot}");
+
+        let mut reverted = native_cache_request(
+            session,
+            vec![ck("t4", 2, "new turn")],
+            Vec::new(),
+            "reconcile-fp-2",
+        );
+        reverted.tail_delta = Some(json!({
+            "after": "reconcile-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let soft = call_transform_request(&handler, serde_json::to_value(reverted).unwrap()).await;
+        assert_eq!(soft["reconcile_pending"], true, "{soft}");
+        let loaded = store.load(session).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 99;
+        store
+            .commit(session, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let mut recut = native_cache_request(
+            session,
+            vec![ck("t4", 2, "new turn")],
+            Vec::new(),
+            "reconcile-fp-3",
+        );
+        recut.tail_delta = Some(json!({
+            "after": "reconcile-fp-2",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let hard = call_transform_request(&handler, serde_json::to_value(recut).unwrap()).await;
+        assert_eq!(hard["action"], "HARD", "{hard}");
+        assert_eq!(hard["boundary_id"], "a#0");
+        assert_eq!(hard["coverage_ordinal"], 1);
+        assert_eq!(hard["reconcile_pending"], false);
+        assert_eq!(hard["timings"]["projection_reused_messages"], 1);
+        let durable = store.load(session).unwrap();
+        assert_eq!(durable.meta.revert_epoch, 1);
+        let acknowledged = handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_request_clone(session)
+            .unwrap();
+        let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
+        let cache = handler
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex");
+        let cached = &cache.sessions[session];
+        assert_eq!(cached.revert_epoch, durable.meta.revert_epoch);
+        assert_eq!(cached.snapshot.projection.as_deref(), Some(&expected));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_boundary_divergence_recut_retries_cas_without_stale_projection() {
+        let session = "projection-boundary-recut-cas";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        let mut previous = crate::transform::tests::seed_astro_divergence(&store, session, 2_442);
+        previous.serializer_profile = "opencode-aisdk".to_string();
+        previous.serve_native = true;
+        previous.native_messages = Some(Vec::new());
+        previous.full_array_fingerprint = Some("boundary-recut-fp-1".to_string());
+        let epoch = store.load(session).unwrap().meta.revert_epoch;
+        seed_handler_delta_snapshot(&handler, &previous, epoch);
+
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_fired);
+        let hook_store = Arc::clone(&store);
+        let hook_session = session.to_string();
+        crate::transform::install_transform_attempt_hook(session, move || {
+            assert!(!hook_flag.swap(true, Ordering::SeqCst));
+            let loaded = hook_store.load(&hook_session).unwrap();
+            hook_store
+                .commit(
+                    &hook_session,
+                    loaded.row_version,
+                    &loaded.core,
+                    &loaded.meta,
+                )
+                .unwrap();
+        });
+
+        let replace_from = previous.messages.len() - 1;
+        let mut delta = native_cache_request(
+            session,
+            vec![previous.messages[replace_from].clone()],
+            Vec::new(),
+            "boundary-recut-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "boundary-recut-fp-1",
+            "replace_from": replace_from,
+            "native_replace_from": 0,
+        }));
+        let response = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        assert!(hook_fired.load(Ordering::SeqCst));
+        assert_eq!(response["action"], "HARD");
+        assert_eq!(response["materialize_reason"], "boundary_divergence_recut");
+        assert_eq!(response["boundary_id"], "m2400#0");
+        assert_eq!(response["coverage_ordinal"], 2400);
+        assert_eq!(
+            response["timings"]["projection_reused_messages"],
+            replace_from
+        );
+        let acknowledged = handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_request_clone(session)
+            .unwrap();
+        let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
+        let cache = handler.native_attachments.lock().unwrap();
+        let cached = cache.sessions[session]
+            .snapshot
+            .projection
+            .as_deref()
+            .expect("post-retry projection");
+        assert_eq!(cached, &expected);
+        assert_eq!(cached.differential_bytes(), expected.differential_bytes());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_tail_mutation_re_adopts_identity_from_cached_prefix() {
+        let session = "projection-tail-readopt";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        store
+            .replace_compartments(session, &[stored_comp(1, 1, 1, "covered", "SUMMARY")])
+            .unwrap();
+        let initial = native_cache_request(
+            session,
+            vec![ck("covered", 1, "covered"), ck("tail", 2, "before")],
+            Vec::new(),
+            "readopt-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+        let old_identity = store.load(session).unwrap().meta.block_identity_by_mid["tail"].clone();
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("tail", 2, "after")],
+            Vec::new(),
+            "readopt-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "readopt-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let adopted = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(adopted["status"], "ok", "{adopted}");
+        assert_eq!(adopted["timings"]["projection_reused_messages"], 1);
+        assert_eq!(adopted["first_divergence"]["kind"], "content_changed");
+        let durable = store.load(session).unwrap();
+        assert_eq!(durable.meta.tail_identity_re_adopt_count, 1);
+        assert_ne!(durable.meta.block_identity_by_mid["tail"], old_identity);
+        let acknowledged = handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_request_clone(session)
+            .unwrap();
+        let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
+        assert_eq!(
+            handler.native_attachments.lock().unwrap().sessions[session]
+                .snapshot
+                .projection
+                .as_deref(),
+            Some(&expected)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_d5_lineage_descent_forces_full_projection() {
+        let target = "projection-lineage-target";
+        let source = "projection-lineage-source";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), target));
+        handler.bind_route(8, binding(project.to_str().unwrap(), source));
+        let source_messages = (1..=10)
+            .map(|ordinal| {
+                ck(
+                    &format!("prior-{ordinal}"),
+                    ordinal,
+                    &format!("turn {ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_request =
+            native_cache_request(source, source_messages, Vec::new(), "lineage-source-fp");
+        let source_response = call_transform_request_on_channel(
+            &handler,
+            8,
+            serde_json::to_value(source_request).unwrap(),
+        )
+        .await;
+        assert_eq!(source_response["status"], "ok", "{source_response}");
+        store
+            .append_compartments(
+                source,
+                &[
+                    stored_comp(1, 1, 3, "prior-3", "history one through three"),
+                    stored_comp(2, 4, 6, "prior-6", "history four through six"),
+                ],
+            )
+            .unwrap();
+        let source_epoch = store.load(source).unwrap().meta.revert_epoch;
+        let summary = "This session is being continued from a previous conversation.\n\nSummary:\nDurable summary alpha\n\nFull transcript: /tmp/session.jsonl";
+        let compaction_user = CkIngressMessage {
+            mid: "lineage-summary".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![
+                    CkWireBlock::bare(CkKind::Text {
+                        text: "<system-reminder>Today's date: 2026-08-10</system-reminder>"
+                            .to_string(),
+                    }),
+                    CkWireBlock::bare(CkKind::Text {
+                        text: summary.to_string(),
+                    }),
+                ],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("lineage-summary".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let initial_messages = vec![
+            compaction_user,
+            ck_with_role("lineage-tail", 2, "assistant", "continued answer"),
+        ];
+        let configure_lineage = |request: &mut TransformRequest, subagent: bool| {
+            request.lineage_switched = true;
+            request.is_subagent = subagent;
+            request.descent_edge_id = 101;
+            request.prior_conversation_key = source.to_string();
+            request.prior_epoch = source_epoch;
+            request.new_epoch = source_epoch.saturating_add(1);
+            request.constituents = vec![(
+                source.to_string(),
+                target.to_string(),
+                source_epoch.saturating_add(1),
+            )];
+            request.compaction_observed = true;
+        };
+        let mut subagent = native_cache_request(
+            target,
+            initial_messages.clone(),
+            Vec::new(),
+            "lineage-target-fp-1",
+        );
+        configure_lineage(&mut subagent, true);
+        let passthrough =
+            call_transform_request(&handler, serde_json::to_value(subagent).unwrap()).await;
+        assert_eq!(passthrough["status"], "ok", "{passthrough}");
+
+        let mut descent = native_cache_request(
+            target,
+            vec![ck_with_role(
+                "lineage-tail",
+                2,
+                "assistant",
+                "continued answer changed",
+            )],
+            Vec::new(),
+            "lineage-target-fp-2",
+        );
+        configure_lineage(&mut descent, false);
+        descent.tail_delta = Some(json!({
+            "after": "lineage-target-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let descended =
+            call_transform_request(&handler, serde_json::to_value(descent).unwrap()).await;
+        assert_eq!(descended["status"], "ok", "{descended}");
+        assert_eq!(descended["lineage_descent_disposition"], "descended");
+        assert_eq!(descended["lineage_switch_consumed_id"], 101);
+        assert_eq!(descended["timings"]["projection_reused_messages"], 0);
+        assert_eq!(descended["timings"]["projection_projected_messages"], 2);
+        assert!(store.load(target).unwrap().meta.descent_completed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_normalization_matches_full_when_reserved_todo_starts_at_frontier() {
+        let (cached_handler, _cached_store, _cached_dir, _cached_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let (control_handler, _control_store, _control_dir, _control_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let initial_messages = vec![
+            ck("todo-prefix", 1, "prefix"),
+            assistant_tool_call("call-ordinary", 2),
+            tool_result("result-ordinary", 3, "ordinary"),
+        ];
+        for handler in [&cached_handler, &control_handler] {
+            let request = native_cache_request(
+                "ses",
+                initial_messages.clone(),
+                Vec::new(),
+                "todo-normalize-fp-1",
+            );
+            let response =
+                call_transform_request(handler, serde_json::to_value(request).unwrap()).await;
+            assert_eq!(response["status"], "ok", "{response}");
+        }
+
+        let pair = injection::build_synthetic_todo_pair(
+            r#"[{"content":"pin normalization","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let mut call = pair.assistant_msg;
+        call.meta.synthetic = false;
+        call.meta.harness_id = Some("todo-reserved-call".to_string());
+        let mut result = pair.tool_msg;
+        result.meta.synthetic = false;
+        result.meta.harness_id = Some("todo-reserved-result".to_string());
+        let changed_messages = vec![
+            ck("todo-prefix", 1, "prefix"),
+            CkIngressMessage {
+                mid: "todo-reserved-call".to_string(),
+                ordinal: 2,
+                ck: call,
+            },
+            CkIngressMessage {
+                mid: "todo-reserved-result".to_string(),
+                ordinal: 3,
+                ck: result,
+            },
+        ];
+        let mut delta = native_cache_request(
+            "ses",
+            changed_messages[1..].to_vec(),
+            Vec::new(),
+            "todo-normalize-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "todo-normalize-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let cached =
+            call_transform_request(&cached_handler, serde_json::to_value(delta).unwrap()).await;
+        let full = call_transform_request(
+            &control_handler,
+            serde_json::to_value(native_cache_request(
+                "ses",
+                changed_messages,
+                Vec::new(),
+                "todo-normalize-fp-2",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(cached["status"], "ok", "{cached}");
+        assert_eq!(cached["timings"]["projection_reused_messages"], 1);
+        assert_eq!(cached["ck_messages"], full["ck_messages"]);
+        let cached_projection = cached_handler.native_attachments.lock().unwrap().sessions["ses"]
+            .snapshot
+            .projection
+            .clone()
+            .unwrap();
+        let full_projection = control_handler.native_attachments.lock().unwrap().sessions["ses"]
+            .snapshot
+            .projection
+            .clone()
+            .unwrap();
+        assert_eq!(cached_projection, full_projection);
+        assert!(cached_projection
+            .blocks
+            .iter()
+            .skip(1)
+            .all(|block| block.synthetic));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13902,7 +16449,15 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(replay.native_messages, Some(actual_native));
+        assert_eq!(
+            replay
+                .native_messages
+                .expect("native replay")
+                .iter()
+                .map(|message| message.as_ref().clone())
+                .collect::<Vec<_>>(),
+            actual_native
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14143,7 +16698,7 @@ mod tests {
         assert_eq!(second.receive_count, 2);
         assert_eq!(second.reject_count, 2);
         assert_eq!(second.last_reject_error.as_deref(), Some(message.as_str()));
-        assert!(second.last_reject_at_ms.unwrap() >= first.last_reject_at_ms.unwrap());
+        assert!(second.last_reject_at_ms.unwrap() > first.last_reject_at_ms.unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14348,7 +16903,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_manifest_freezes_per_model_epoch_and_keeps_ids_and_schemas_stable() {
+    async fn session_manifest_freezes_per_model_and_config_epoch_and_keeps_ids_and_schemas_stable()
+    {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         handler.bind_route(30, binding("/tmp/project", "manifest-ses"));
@@ -14359,6 +16915,7 @@ mod tests {
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
                 "model_key": "provider/model-a",
+                "config_identity": "config-a",
                 "preset": "light",
                 "tool_descriptions": { "ctx_search": "Search override A." },
             }),
@@ -14374,6 +16931,7 @@ mod tests {
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
                 "model_key": "provider/model-a",
+                "config_identity": "config-a",
                 "preset": "full",
                 "tool_descriptions": { "ctx_search": "Ignored mid-epoch override." },
             }),
@@ -14390,7 +16948,8 @@ mod tests {
             json!({
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
-                "model_key": "provider/model-b",
+                "model_key": "provider/model-a",
+                "config_identity": "config-b",
                 "preset": "full",
                 "tool_descriptions": { "ctx_search": "Search override B." },
             }),
@@ -14417,6 +16976,130 @@ mod tests {
                 assert_eq!(actual.execution_mode, expected.execution_mode);
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_reload_reselects_guidance_and_manifest_together_then_stays_frozen() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let session = "prompt-config-reload";
+        handler.bind_route(31, binding("/tmp/project", session));
+        handler.guidance_dates.lock().unwrap().insert(
+            session.to_string(),
+            "Today's date: Fri Jan 01 2016".to_string(),
+        );
+
+        let guidance_light = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "light",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_light = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "light",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_light["preset"], json!("light"));
+        assert_eq!(manifest_light["preset"], json!("light"));
+        assert_eq!(
+            guidance_light["manifest_content_epoch"],
+            manifest_light["content_epoch"]
+        );
+
+        let guidance_stable = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "full",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_stable = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "full",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_stable, guidance_light);
+        assert_eq!(manifest_stable, manifest_light);
+
+        let guidance_full = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "full",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_full = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "full",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_full["preset"], json!("full"));
+        assert_eq!(manifest_full["preset"], json!("full"));
+        assert_ne!(guidance_full["bytes"], guidance_light["bytes"]);
+        assert_ne!(
+            manifest_full["content_epoch"],
+            manifest_light["content_epoch"]
+        );
+        assert_eq!(
+            guidance_full["manifest_content_epoch"],
+            manifest_full["content_epoch"]
+        );
+
+        let guidance_full_repeat = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "light",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        assert_eq!(guidance_full_repeat, guidance_full);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16644,6 +19327,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_advances_model_chain_after_outage_text() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Ok(ProducerOutput {
+                    text: "All Antigravity endpoints failed".to_string(),
+                    length_capped: false,
+                }),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        let mut route_binding = binding(route_root, "ses");
+        route_binding.config.model_chain =
+            vec!["test/bad-model".to_string(), "test/good-model".to_string()];
+        handler.bind_route(7, route_binding);
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "model-chain-command",
+                    "authority_generation": generation,
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("dreamer run failed: {other:?}"),
+        };
+
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(response["manifest_text"], json!("<classify></classify>"));
+        assert_eq!(response["diagnostics"]["model"], json!("test/good-model"));
+        assert_eq!(response["diagnostics"]["attempts"], json!(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_dreamer_run_unregisters_its_child_session() {
         let producer = Arc::new(ProducerState::default());
         producer.block_output.store(true, Ordering::SeqCst);
@@ -16745,6 +19483,7 @@ mod tests {
         let request = request(vec![ck("m0", 0, "live input")]);
         let initial = call_transform_request(&handler, request.clone()).await;
         assert_eq!(initial["action"], "HARD");
+        assert_eq!(initial["rendered_memory_ids"], json!([source]));
         assert_eq!(
             store.load("ses").unwrap().meta.rendered_memory_ids,
             vec![source]
@@ -17335,6 +20074,44 @@ mod tests {
         assert!(historical["pass_id"].is_number());
         assert!(historical["timestamp_ms"].is_number());
         assert_eq!(historical["divergence"], diverging["first_divergence"]);
+
+        let appended = request(vec![ck("m1", 1, "after"), ck("m2", 2, "before")]);
+        let append_only = call_transform_request(&handler, appended.clone()).await;
+        assert!(append_only.get("first_divergence").is_none());
+        let second_diverging = call_transform_request(
+            &handler,
+            request(vec![ck("m1", 1, "after"), ck("m2", 2, "after")]),
+        )
+        .await;
+        assert!(second_diverging["first_divergence"].is_object());
+        let second_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expected status response, got {other:?}"),
+        };
+        let second_historical: Value = serde_json::from_str(
+            second_status["pass_trace"]["last_divergence"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            second_historical["divergence"],
+            second_diverging["first_divergence"]
+        );
+        assert_ne!(
+            historical["divergence"]["block_id_old"],
+            second_historical["divergence"]["block_id_old"],
+            "different divergent blocks must remain distinguishable in the durable trace"
+        );
+        let stable_again = call_transform_request(
+            &handler,
+            request(vec![ck("m1", 1, "after"), ck("m2", 2, "after")]),
+        )
+        .await;
+        assert!(stable_again.get("first_divergence").is_none());
 
         let session_status = tool_body(handler.handle_session_status_value(
             7,
@@ -18586,10 +21363,48 @@ mod tests {
         assert!(summary.contains("2 tags"));
         assert!(summary.contains("pending m1 delta true age_ms=0"));
         assert!(summary.contains("last historian: published seq 3"));
+        assert_eq!(body["tag_count"], json!(2));
         assert_eq!(body["pending_m1_delta"], json!(true));
         assert_eq!(body["pending_m1_age_ms"], json!(0));
         assert_eq!(body["tail_identity_re_adopt_count"], json!(0));
         assert!(summary.ends_with("surface active"));
+    }
+
+    #[test]
+    fn session_delete_clears_durable_state_for_the_bound_lineage() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let session_id = "ses-delete";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
+        store
+            .commit(
+                session_id,
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+            )
+            .unwrap();
+        store
+            .seed_tags_for_test(
+                session_id,
+                &[TagMintInput {
+                    block_id: "m1#0".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: b"one".to_vec(),
+                }],
+                1,
+            )
+            .unwrap();
+
+        let deleted = tool_body(handler.handle_session_delete_value(
+            7,
+            &json!({ "method": "session.delete", "v": 1, "session_id": session_id }),
+        ));
+        assert_eq!(deleted["ok"], json!(true));
+        assert!(deleted["deleted_rows"].as_u64().unwrap() >= 2);
+        assert!(!store.has_cache_state(session_id).unwrap());
+        assert!(store.load_tags_for_session(session_id).unwrap().is_empty());
     }
 
     #[test]
@@ -20504,6 +23319,7 @@ mod tests {
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -21277,6 +24093,7 @@ mod tests {
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -21876,6 +24693,52 @@ mod tests {
             store.load_active_memories(&project_path, 0).unwrap()[0].content,
             "authority memory"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_todowrite_clears_cold_start_seed_on_first_bust() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let state_json =
+            r#"[{"content":"Seeded before disable","status":"in_progress","priority":"high"}]"#;
+        let pair = injection::build_synthetic_todo_pair(state_json).unwrap();
+        let call_id = pair.call_id.clone();
+        let seeded = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "last_todo_state": state_json,
+                    "todo_synthetic_anchor": {
+                        "call_id": call_id,
+                        "message_id": "tail",
+                        "state_json": state_json
+                    },
+                    "acked_watermarks": {}
+                }),
+            )
+            .await;
+        assert!(matches!(seeded, HandlerOutcome::Response(_)), "{seeded:?}");
+        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_some());
+
+        let mut first_request = request(vec![ck("tail", 0, "live tail")]);
+        first_request["todo_tool_present"] = json!(false);
+        let first = call_transform_request(&handler, first_request).await;
+
+        assert!(
+            matches!(first["decision"].as_str(), Some("HARD" | "SOFT+")),
+            "{first}"
+        );
+        assert!(first["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .all(|block| block["kind"]["name"] != json!("todowrite")));
+        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_none());
     }
 
     #[tokio::test]

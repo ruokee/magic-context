@@ -5,13 +5,11 @@ import {
     type Dirent,
     existsSync,
     mkdirSync,
-    mkdtempSync,
     readdirSync,
     readFileSync,
     statSync,
     unlinkSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
@@ -20,7 +18,12 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { isPidAlive, isPidIdentityPlausible, parseRpcPortFile } from "../../shared/rpc-utils";
+import {
+    discoverLivePiProcessIds,
+    isPidAlive,
+    isPidIdentityPlausible,
+    parseRpcPortFile,
+} from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
@@ -85,7 +88,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 75;
+export const LATEST_SUPPORTED_VERSION = 76;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -158,77 +161,12 @@ export function resolveDatabasePath(dbPathOverride?: string): { dbDir: string; d
     if (dbPathOverride) {
         return { dbDir: dirname(dbPathOverride), dbPath: dbPathOverride };
     }
-    // Test-isolation guard. Under the test runner the preload
-    // (bunfig.toml `[test] preload`) sets MAGIC_CONTEXT_TEST_DATA_DIR to a
-    // throwaway temp dir AND XDG_DATA_HOME to the same dir. Tests that manage
-    // their OWN XDG_DATA_HOME (per-test temp dirs) keep working — we honor XDG
-    // below via getMagicContextStorageDir(). The guard fires ONLY when
-    // XDG_DATA_HOME is UNSET: that is the dangerous window, because
-    // getMagicContextStorageDir() would otherwise fall back to the REAL
-    // ~/.local/share and a bare openDatabase() would run migrations on the
-    // user's production DB. Some tests delete XDG_DATA_HOME to exercise
-    // path-fallback behavior (2026-06-01 incident: a dormant test migrated the
-    // live DB to v26 and fail-closed every running v25 binary); in that window
-    // we resolve into the dedicated test dir instead of the real path. No test
-    // mutates MAGIC_CONTEXT_TEST_DATA_DIR, so the guard cannot be defeated. It
-    // is never set in production.
-    const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
-    if (testDataDir && !process.env.XDG_DATA_HOME) {
-        const dbDir = join(testDataDir, "cortexkit", "magic-context");
-        return { dbDir, dbPath: join(dbDir, "context.db") };
-    }
-    // CWD-INDEPENDENT TEST BACKSTOP. The MAGIC_CONTEXT_TEST_DATA_DIR / XDG guard
-    // above only fires when the bunfig `[test] preload` ran — which depends on
-    // `bun test`'s CWD having a bunfig with `[test] preload`. A `bun test` from a
-    // dir WITHOUT that wiring (monorepo root, a package missing its bunfig, or a
-    // brand-new package) recursively runs every *.test.ts with NO preload, so a
-    // bare openDatabase() would resolve to the user's REAL shared DB and run
-    // migrations on it. That is exactly how the live DB was migrated to v41 by a
-    // worktree whose LATEST was 41 (a re-run of the 2026-06-01 v26 incident).
-    //
-    // Bun sets NODE_ENV=test for EVERY `bun test` regardless of CWD/bunfig (and
-    // it is never "test" in the plugin runtime — production never sets it). So if
-    // we are under the test runner with neither the test data dir nor an explicit
-    // override, we MUST NOT touch real storage: redirect into a throwaway temp dir
-    // so the live DB is physically unreachable. This makes it structurally
-    // impossible for ANY test, from ANY CWD, to read or migrate production data.
-    // Fire ONLY when XDG_DATA_HOME is unset: that is the dangerous window where
-    // getMagicContextStorageDir() below would otherwise resolve to the REAL
-    // ~/.local/share shared DB. When a test sets its own XDG_DATA_HOME (a
-    // per-test temp dir, e.g. to exercise path fallbacks or share a DB across
-    // helper calls), getMagicContextStorageDir() already points inside that
-    // controlled dir — honor it, do not override.
-    if (process.env.NODE_ENV === "test" && !process.env.XDG_DATA_HOME) {
-        // Memoized per-process so repeated openDatabase() calls in the same
-        // unisolated test resolve to the SAME path (openDatabase caches by path;
-        // a fresh temp dir per call would defeat the cache and hand back
-        // different DB handles).
-        const dbDir = getTestBackstopDbDir();
-        if (!testBackstopWarned) {
-            testBackstopWarned = true;
-            log(
-                "[magic-context] TEST BACKSTOP: NODE_ENV=test with no MAGIC_CONTEXT_TEST_DATA_DIR " +
-                    `— redirecting DB to a throwaway temp dir (${dbDir}) so no test can touch the ` +
-                    "user's real shared database. Wire `[test] preload` in this package's bunfig.toml.",
-            );
-        }
-        return { dbDir, dbPath: join(dbDir, "context.db") };
-    }
+    // Test-isolation guards (MAGIC_CONTEXT_TEST_DATA_DIR + the CWD-independent
+    // NODE_ENV backstop) both live in getMagicContextStorageDir(), so this
+    // resolver and every direct caller of that helper are covered by one
+    // implementation. See its doc comment for the incident history.
     const dbDir = getMagicContextStorageDir();
     return { dbDir, dbPath: join(dbDir, "context.db") };
-}
-
-let testBackstopDbDir: string | null = null;
-let testBackstopWarned = false;
-function getTestBackstopDbDir(): string {
-    if (!testBackstopDbDir) {
-        testBackstopDbDir = join(
-            mkdtempSync(join(tmpdir(), "mc-test-db-backstop-")),
-            "cortexkit",
-            "magic-context",
-        );
-    }
-    return testBackstopDbDir;
 }
 
 export function getDatabasePath(db: Database): string | null {
@@ -548,17 +486,21 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-/** Return the live OpenCode servers that would block an on-open migration. */
+/** Return the live harnesses that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
-    if (discovery.state !== "live") return [];
-    return discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }));
+    const openCode =
+        discovery.state === "live"
+            ? discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }))
+            : [];
+    const pi = discoverLivePiProcessIds().map((pid) => ({ harness: "Pi harness", pid }));
+    return [...openCode, ...pi];
 }
 
 /**
- * Refuse an on-open migration when another live OpenCode server still has this
- * shared DB open. That server loaded its plugin dist at boot and cannot observe
- * the new fence, so migrating here would strand every session it creates later.
+ * Refuse an on-open migration while another long-lived harness may still run an
+ * older build. OpenCode servers keep their plugin loaded, and a live Pi process
+ * can spawn a child with its loaded extension after another process migrates.
  */
 function enforceMigrationOnOpenGuard(
     db: Database,
@@ -572,14 +514,18 @@ function enforceMigrationOnOpenGuard(
         return true;
     }
     const discovery = inspectRpcServerDiscovery(dbDir);
-    if (discovery.state === "absent" || discovery.state === "stale") {
+    const piPids = discoverLivePiProcessIds();
+    if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
         lastMigrationOnOpenRefusal = null;
         return true;
     }
+    const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
+        (left, right) => left - right,
+    );
     lastMigrationOnOpenRefusal = {
         persistedVersion,
         supportedVersion: latestSupportedVersion,
-        serverPids: discovery.serverPids,
+        serverPids: blockingPids,
         ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
         ...(discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}),
     };
@@ -594,8 +540,12 @@ function enforceMigrationOnOpenGuard(
             `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`,
         );
     } else {
+        const blockers = [
+            ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
+            ...piPids.map((pid) => `Pi harness PID ${pid}`),
+        ];
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${discovery.serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`,
         );
     }
     return false;

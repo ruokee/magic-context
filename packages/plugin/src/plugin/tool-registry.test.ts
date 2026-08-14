@@ -1,15 +1,22 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { resetCtxReduceRegisteredGloballyForTest } from "../hooks/magic-context/ctx-reduce-availability";
+import {
+    A1_HASH_BASELINE_HEADING,
+    A1_TOOL_SECTION_HEADING,
+    a1GoldenSectionOffset,
+    readA1GoldenDocument,
+} from "../shared/prompt-surface-a1-golden";
 import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import {
+    ACTIVE_TOOL_IDS,
     createPromptSurfaceRuntime,
     LIGHT_TOOL_DESCRIPTIONS,
 } from "../shared/prompt-surface-runtime";
@@ -204,13 +211,10 @@ describe("createToolRegistry — compaction-off mode (#266 S4)", () => {
 type GoldenTool = { description: string; parameters: Record<string, unknown> };
 
 function readA1GoldenTools(): Record<string, GoldenTool> {
-    const document = readFileSync(
-        join(import.meta.dir, "../shared/prompt-surface-a1-golden.md"),
-        "utf8",
-    );
+    const document = readA1GoldenDocument();
     const toolSection = document.slice(
-        document.indexOf("## 2. Tool surface"),
-        document.indexOf("## 3. System-prompt hash baseline"),
+        a1GoldenSectionOffset(document, A1_TOOL_SECTION_HEADING),
+        a1GoldenSectionOffset(document, A1_HASH_BASELINE_HEADING),
     );
     const headings = [...toolSection.matchAll(/^### (ctx_[a-z_]+) —.*$/gm)];
     return Object.fromEntries(
@@ -248,6 +252,32 @@ function providerParameters(definition: ToolDefinition): Record<string, unknown>
 }
 
 describe("createToolRegistry — prompt-surface registration", () => {
+    it("links canonical prompt-surface IDs to light descriptions and registration", () => {
+        isolateDb();
+        const registeredCtxToolIds = Object.keys(buildRegistry({})).filter((id) =>
+            id.startsWith("ctx_"),
+        );
+        const canonicalIds = new Set<string>(ACTIVE_TOOL_IDS);
+        const registeredIds = new Set(registeredCtxToolIds);
+        const missing = [...canonicalIds].filter((id) => !registeredIds.has(id));
+        const extra = [...registeredIds].filter((id) => !canonicalIds.has(id));
+        if (missing.length > 0 || extra.length > 0) {
+            throw new Error(
+                [
+                    "Prompt-surface tool registry drifted from ACTIVE_TOOL_IDS.",
+                    `Missing: ${missing.join(", ") || "none"}.`,
+                    `Extra: ${extra.join(", ") || "none"}.`,
+                    "If this is a new ctx_* tool, also review the Rust prompt-surface list in crates/mc-module/src/prompt_surface.rs; cross-language drift is intentionally checked separately.",
+                ].join(" "),
+            );
+        }
+
+        for (const id of ACTIVE_TOOL_IDS) {
+            expect(Object.hasOwn(LIGHT_TOOL_DESCRIPTIONS, id)).toBe(true);
+            expect(LIGHT_TOOL_DESCRIPTIONS[id].trim().length).toBeGreaterThan(0);
+        }
+    });
+
     it("matches the A1 golden for no config and explicit full", () => {
         const golden = readA1GoldenTools();
         isolateDb();
