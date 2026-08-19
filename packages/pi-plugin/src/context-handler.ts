@@ -238,6 +238,12 @@ import { createPiTranscript } from "./transcript-pi";
 /** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */
 const EMERGENCY_BLOCK_PERCENTAGE = 95;
 
+// OMP aborts a context handler after 30s. Waiting that entire interval for a
+// historian guarantees the host can send the untrimmed request first; leave
+// ample headroom for the rest of the transform to finish and let the historian
+// publish for the next pass if it is still running.
+const EMERGENCY_HISTORIAN_WAIT_MS = 5_000;
+
 // estimateTokens (char-based) under-counts the real provider
 // tokenizer + untagged structural/reasoning parts: the observed overflow was
 // >400K real vs a ~340K forward estimate (~15% gap). Scaling the limit DOWN for
@@ -287,9 +293,11 @@ let afterFallbackAdoptionForTests:
 	| undefined;
 
 export const __test = {
+	EMERGENCY_HISTORIAN_WAIT_MS,
 	FORWARD_PRESSURE_LIMIT_FACTOR,
 	adoptPiFallbackTags,
 	applyForwardPressureFloor,
+
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
 	readPiBranchEntriesForContext,
@@ -2711,7 +2719,7 @@ export function registerPiContextHandler(
 				const histPromise = inFlightHistorian.get(sessionId);
 				if (histPromise) {
 					try {
-						await withTimeout(histPromise, 30_000);
+						await withTimeout(histPromise, EMERGENCY_HISTORIAN_WAIT_MS);
 						sessionLog(
 							sessionId,
 							"EMERGENCY: historian wait completed (or timed out)",

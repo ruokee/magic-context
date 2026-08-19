@@ -89,6 +89,12 @@ import { createPiTranscript } from "./transcript-pi";
 describe("applyForwardPressureFloor", () => {
 	const { FORWARD_PRESSURE_LIMIT_FACTOR, applyForwardPressureFloor } =
 		contextHandlerInternals;
+	it("keeps emergency historian waits below the OMP handler deadline", () => {
+		expect(contextHandlerInternals.EMERGENCY_HISTORIAN_WAIT_MS).toBe(5_000);
+		expect(contextHandlerInternals.EMERGENCY_HISTORIAN_WAIT_MS).toBeLessThan(
+			30_000,
+		);
+	});
 
 	it("floors stale trailing pressure with Pi's live forward token estimate", () => {
 		const result = applyForwardPressureFloor(68, 273_200, 340_000, 400_000);
